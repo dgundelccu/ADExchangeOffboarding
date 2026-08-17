@@ -29,11 +29,19 @@ param(
     [switch]$OverrideSharedMailboxLicenseSafety,
     [switch]$Force,
 
-    [string]$LogPath = (Join-Path $PSScriptRoot ("EmployeeOffboarding-{0:yyyyMMdd-HHmmss}.csv" -f (Get-Date)))
+    [string]$LogPath
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($LogPath)) {
+    if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        throw 'The script folder could not be determined. Run the saved PS1 file or use Run-EmployeeOffboarding.bat; do not run pasted or selected code.'
+    }
+
+    $LogPath = Join-Path -Path $PSScriptRoot -ChildPath ("EmployeeOffboarding-{0:yyyyMMdd-HHmmss}.csv" -f (Get-Date))
+}
 
 if (-not $User) {
     $User = Read-Host 'Employee to offboard (SAMAccountName)'
