@@ -292,6 +292,18 @@ catch {
     throw "Unable to resolve the employee in Active Directory: $($_.Exception.Message)"
 }
 
+do {
+    $ConfirmEmployee = (Read-Host "is $($EmployeeAD.DisplayName) ($(EmployeeAD.SamAccountName)) the user you want to offboard? (YES or NO)").Trim().ToUpperInvariant()
+    if ($ConfirmEmployee -notin @('YES', 'NO')){
+        Write-Warning 'Must enter exactly YES or NO pls...'
+    }
+}
+while ($ConfirmEmployee -notin @('YES', 'NO'))
+
+if ($ConfirmEmployee -eq 'NO'){
+    Write-Host 'Cancelled... No changes were made.' -ForegroundColor Red
+    return
+}
 # Build the Notes value without deleting unrelated text. An old TERM line is replaced, not duplicated.
 $User = $EmployeeAD.SamAccountName
 $ExistingADNotes = [string]$EmployeeAD.info
