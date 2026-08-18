@@ -20,7 +20,7 @@ param(
     [string]$CreateSharedMailbox,
     [datetime]$TerminationDate = (Get-Date),
 
-    [string[]]$KeepADGroups = @('Domain Users', 'SG_Intranet Users'),
+    [string[]]$KeepADGroups = @('Domain Users', 'SG_DC2_Intranet_Users_RW'),
     [switch]$GrantSendAs,
     [switch]$TransferSoleOwnedMicrosoft365GroupsToManager,
     [switch]$SkipCloudGroupRemoval,
