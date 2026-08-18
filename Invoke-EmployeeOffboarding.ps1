@@ -10,7 +10,6 @@ param(
     [string]$AdminUser,
     [System.Management.Automation.PSCredential]$ADCredential,
     [string]$ExchangeAdminUPN,
-    [string]$GraphAdminUPN,
 
     # Required for a directory-synchronized remote mailbox unless the on-premises
     # Exchange cmdlets are already loaded in this PowerShell session.
@@ -260,10 +259,6 @@ if ($ManagerRequired) {
 
 $RequiredModules = @(
     'ExchangeOnlineManagement'
-    'Microsoft.Graph.Authentication'
-    'Microsoft.Graph.Users'
-    'Microsoft.Graph.Users.Actions'
-    'Microsoft.Graph.Groups'
 )
 
 foreach ($Module in $RequiredModules) {
@@ -273,10 +268,6 @@ foreach ($Module in $RequiredModules) {
 }
 
 Import-Module ExchangeOnlineManagement -ErrorAction Stop
-Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-Import-Module Microsoft.Graph.Users -ErrorAction Stop
-Import-Module Microsoft.Graph.Users.Actions -ErrorAction Stop
-Import-Module Microsoft.Graph.Groups -ErrorAction Stop
 
 if ($CreateSharedMailboxRequested -and -not $CloudOnlyMailbox) {
     if ($OnPremExchangeServer) {
@@ -330,32 +321,6 @@ catch {
     Write-Host '  Connected to Exchange Online.' -ForegroundColor Green
 }
 
-$RequiredScopes = @(
-    'User.Read.All'
-    'User.EnableDisableAccount.All'
-    'User.RevokeSessions.All'
-    'GroupMember.ReadWrite.All'
-)
-$GraphContext = Get-MgContext
-$MissingScopes = if ($GraphContext) {
-    @($RequiredScopes | Where-Object { $_ -notin $GraphContext.Scopes })
-}
-else {
-    @($RequiredScopes)
-}
-
-if (-not $GraphContext -or $GraphContext.ContextScope -ne 'Process' -or $MissingScopes.Count -gt 0 -or
-        ($GraphAdminUPN -and $GraphContext.Account -ine $GraphAdminUPN)) {
-    Connect-MgGraph -Scopes $RequiredScopes -ContextScope Process -NoWelcome -ErrorAction Stop | Out-Null
-    $GraphContext = Get-MgContext
-}
-
-if ($GraphAdminUPN -and $GraphContext.Account -ine $GraphAdminUPN) {
-    throw "Microsoft Graph connected as '$($GraphContext.Account)', but -GraphAdminUPN requires '$GraphAdminUPN'. Re-run and choose the required Graph administrator account during sign-in."
-}
-
-Write-Host "  Microsoft Graph account: $($GraphContext.Account)" -ForegroundColor Green
-
 $EmployeeEXO = Resolve-EXORecipient -ADUser $EmployeeAD -Role 'employee'
 $EmployeeAddress = Get-NormalizedAddress $EmployeeEXO.PrimarySmtpAddress
 $ManagerEXO = $null
@@ -363,20 +328,6 @@ $ManagerAddress = $null
 if ($ManagerRequired) {
     $ManagerEXO = Resolve-EXORecipient -ADUser $ManagerAD -Role 'manager'
     $ManagerAddress = Get-NormalizedAddress $ManagerEXO.PrimarySmtpAddress
-}
-
-try {
-    $GraphUser = Get-MgUser `
-        -UserId $EmployeeAD.UserPrincipalName `
-        -Property Id, DisplayName, UserPrincipalName, AccountEnabled, OnPremisesSyncEnabled, AssignedLicenses, LicenseAssignmentStates `
-        -ErrorAction Stop
-}
-catch {
-    throw "Could not resolve '$($EmployeeAD.UserPrincipalName)' in Microsoft Graph: $($_.Exception.Message)"
-}
-
-if ($CreateSharedMailboxRequested -and $CloudOnlyMailbox -and $GraphUser.OnPremisesSyncEnabled) {
-    throw "-CloudOnlyMailbox cannot be used because '$($GraphUser.UserPrincipalName)' is directory-synchronized. Supply -OnPremExchangeServer so both mailbox objects are converted safely."
 }
 
 try {
@@ -388,6 +339,23 @@ try {
 }
 catch {
     throw "Could not resolve and inspect the employee mailbox: $($_.Exception.Message)"
+}
+
+if ($CreateSharedMailboxRequested -and $CloudOnlyMailbox) {
+    try {
+        $MailboxDirectoryState = Get-Mailbox -Identity $EmployeeAddress -ErrorAction Stop
+    }
+    catch {
+        throw "Could not verify whether '$EmployeeAddress' is directory-synchronized: $($_.Exception.Message)"
+    }
+
+    $IsDirSyncedProperty = $MailboxDirectoryState.PSObject.Properties['IsDirSynced']
+    if (-not $IsDirSyncedProperty -or $IsDirSyncedProperty.Value -isnot [bool]) {
+        throw "-CloudOnlyMailbox cannot be used because Exchange Online did not return the mailbox directory-synchronization state. Supply -OnPremExchangeServer so both mailbox objects are converted safely."
+    }
+    if ($IsDirSyncedProperty.Value) {
+        throw "-CloudOnlyMailbox cannot be used because '$EmployeeAddress' is directory-synchronized. Supply -OnPremExchangeServer so both mailbox objects are converted safely."
+    }
 }
 
 $RemoteMailbox = $null
@@ -406,13 +374,6 @@ try {
 catch {
     throw "Could not enumerate the employee's Active Directory groups: $($_.Exception.Message)"
 }
-
-$DirectSkuIds = @($GraphUser.LicenseAssignmentStates |
-    Where-Object { -not $_.AssignedByGroup } |
-    ForEach-Object { $_.SkuId } |
-    Sort-Object -Unique)
-$DirectSkuIdText = ($DirectSkuIds | ForEach-Object { $_.ToString() }) -join ', '
-$InheritedLicenseStates = @($GraphUser.LicenseAssignmentStates | Where-Object { $_.AssignedByGroup })
 
 $MailboxSizeBytes = ConvertTo-ByteCount $MailboxStatistics.TotalItemSize
 $LicenseBlockers = [System.Collections.Generic.List[string]]::new()
@@ -434,10 +395,10 @@ if ($CreateSharedMailboxRequested) {
 $CloudDistributionGroups = [System.Collections.Generic.List[object]]::new()
 $DistributionGroupInspectionFailures = [System.Collections.Generic.List[object]]::new()
 $Microsoft365GroupPlans = [System.Collections.Generic.List[object]]::new()
-$CloudSecurityGroups = @()
+$Microsoft365GroupInspectionFailures = [System.Collections.Generic.List[object]]::new()
 
 if (-not $SkipCloudGroupRemoval) {
-    Write-Host '  Inspecting Exchange Online and Microsoft Entra group memberships...' -ForegroundColor Gray
+    Write-Host '  Inspecting Exchange Online group memberships...' -ForegroundColor Gray
 
     try {
         foreach ($Group in @(Get-DistributionGroup -ResultSize Unlimited -ErrorAction Stop)) {
@@ -462,44 +423,47 @@ if (-not $SkipCloudGroupRemoval) {
     }
 
     try {
-        $GraphGroups = @(Get-MgUserMemberOfAsGroup `
-            -UserId $GraphUser.Id `
-            -All `
-            -Property Id, DisplayName, Mail, GroupTypes, MailEnabled, SecurityEnabled, OnPremisesSyncEnabled, MembershipRule, IsAssignableToRole, AssignedLicenses `
-            -ErrorAction Stop)
+        $Microsoft365Groups = @(Get-UnifiedGroup -ResultSize Unlimited -ErrorAction Stop)
     }
     catch {
-        throw "Could not enumerate the employee's Microsoft Entra group memberships: $($_.Exception.Message)"
+        throw "Could not enumerate Exchange Online Microsoft 365 groups: $($_.Exception.Message)"
     }
 
-    $CloudSecurityGroups = @($GraphGroups | Where-Object {
-        $_.SecurityEnabled -and -not $_.MailEnabled -and @($_.GroupTypes) -notcontains 'Unified'
-    })
-
-    foreach ($Group in @($GraphGroups | Where-Object { @($_.GroupTypes) -contains 'Unified' })) {
+    foreach ($Group in $Microsoft365Groups) {
         try {
-            $GroupIdentity = Get-NormalizedAddress $Group.Mail
+            $GroupIdentity = Get-NormalizedAddress $Group.PrimarySmtpAddress
             if (-not $GroupIdentity) {
-                throw 'Microsoft Graph did not return the group mail address required by Exchange Online.'
+                throw 'Exchange Online did not return a primary SMTP address for the group.'
             }
 
             $Owners = @(Get-UnifiedGroupLinks -Identity $GroupIdentity -LinkType Owners -ResultSize Unlimited -ErrorAction Stop)
             $Members = @(Get-UnifiedGroupLinks -Identity $GroupIdentity -LinkType Members -ResultSize Unlimited -ErrorAction Stop)
             $IsOwner = @($Owners | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $EmployeeAddress }).Count -gt 0
-            $ManagerIsMember = @($Members | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $ManagerAddress }).Count -gt 0
-            $ManagerIsOwner = @($Owners | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $ManagerAddress }).Count -gt 0
+            $IsMember = @($Members | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $EmployeeAddress }).Count -gt 0
+            if (-not $IsOwner -and -not $IsMember) { continue }
+
+            $ManagerIsMember = $false
+            $ManagerIsOwner = $false
+            if ($ManagerAddress) {
+                $ManagerIsMember = @($Members | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $ManagerAddress }).Count -gt 0
+                $ManagerIsOwner = @($Owners | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $ManagerAddress }).Count -gt 0
+            }
 
             $Microsoft365GroupPlans.Add([pscustomobject]@{
                 Group           = $Group
                 Identity        = $GroupIdentity
                 Owners          = $Owners
                 IsOwner         = $IsOwner
+                IsMember        = $IsMember
                 ManagerIsMember = $ManagerIsMember
                 ManagerIsOwner  = $ManagerIsOwner
             })
         }
         catch {
-            throw "Could not inspect Microsoft 365 group '$($Group.DisplayName)': $($_.Exception.Message)"
+            $Microsoft365GroupInspectionFailures.Add([pscustomobject]@{
+                Group   = $Group.DisplayName
+                Message = $_.Exception.Message
+            })
         }
     }
 }
@@ -517,9 +481,16 @@ Write-Host "AD Notes : $TerminationNote" -ForegroundColor White
 Write-Host "Keep AD  : $($KeepADGroups -join ', ')" -ForegroundColor White
 Write-Host "AD groups: $($ADGroups.Count) direct membership(s) found" -ForegroundColor White
 if (-not $SkipCloudGroupRemoval) {
-    Write-Host "Cloud    : $($CloudDistributionGroups.Count) distribution, $($Microsoft365GroupPlans.Count) Microsoft 365, $($CloudSecurityGroups.Count) security group membership(s) found" -ForegroundColor White
+    Write-Host "Exchange : $($CloudDistributionGroups.Count) distribution and $($Microsoft365GroupPlans.Count) Microsoft 365 group membership/ownership record(s) found" -ForegroundColor White
+    Write-Warning 'Cloud-only, non-mail-enabled Microsoft Entra security groups are not inspected by this Graph-free branch and require manual review.'
 }
-Write-Host "Licenses : $($DirectSkuIds.Count) direct; $($InheritedLicenseStates.Count) group-inherited assignment state(s)" -ForegroundColor White
+if ($DistributionGroupInspectionFailures.Count -gt 0) {
+    Write-Warning "Preflight could not inspect $($DistributionGroupInspectionFailures.Count) Exchange distribution group(s): $(@($DistributionGroupInspectionFailures.Group) -join ', '). These will be flagged for manual follow-up."
+}
+if ($Microsoft365GroupInspectionFailures.Count -gt 0) {
+    Write-Warning "Preflight could not inspect $($Microsoft365GroupInspectionFailures.Count) Microsoft 365 group(s): $(@($Microsoft365GroupInspectionFailures.Group) -join ', '). These will be flagged for manual follow-up."
+}
+Write-Warning 'Microsoft 365 licenses are not inventoried and no license-assignment API is called. AD or Microsoft 365 group removal can still revoke group-assigned licenses.'
 if ($CreateSharedMailboxRequested) {
     Write-Host 'Mailbox action: convert to shared and grant the AD manager Full Access. Direct license removal remains manual.' -ForegroundColor Yellow
 }
@@ -539,7 +510,7 @@ if (-not $Force -and -not $WhatIfPreference) {
     }
 }
 
-Write-Section 'Step 1 - disable sign-in and revoke sessions'
+Write-Section 'Step 1 - disable Active Directory account'
 
 if (-not $EmployeeAD.Enabled) {
     Add-Result -System 'Active Directory' -Item $User -Action 'Disable account' -Status 'Skipped' -Message 'Account is already disabled.'
@@ -577,34 +548,8 @@ else {
     Add-Result -System 'Active Directory' -Item $User -Action 'Set AD Notes termination marker' -Status 'Preview' -Message $TerminationNote
 }
 
-if ($GraphUser.AccountEnabled -eq $false) {
-    Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Block cloud sign-in' -Status 'Skipped' -Message 'Cloud sign-in is already blocked.'
-}
-elseif ($PSCmdlet.ShouldProcess($EmployeeAddress, 'Block Microsoft Entra ID sign-in')) {
-    try {
-        Update-MgUser -UserId $GraphUser.Id -AccountEnabled:$false -ErrorAction Stop
-        Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Block cloud sign-in' -Status 'Completed'
-    }
-    catch {
-        Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Block cloud sign-in' -Status 'Failed' -Message $_.Exception.Message
-    }
-}
-else {
-    Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Block cloud sign-in' -Status 'Preview'
-}
-
-if ($PSCmdlet.ShouldProcess($EmployeeAddress, 'Revoke Microsoft 365 sign-in sessions')) {
-    try {
-        Revoke-MgUserSignInSession -UserId $GraphUser.Id -ErrorAction Stop | Out-Null
-        Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Revoke sign-in sessions' -Status 'Completed'
-    }
-    catch {
-        Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Revoke sign-in sessions' -Status 'Failed' -Message $_.Exception.Message
-    }
-}
-else {
-    Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Revoke sign-in sessions' -Status 'Preview'
-}
+Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Block cloud sign-in manually' -Status 'Attention' -Message 'This Graph-free branch cannot verify or change Entra sign-in status. Block sign-in in the Microsoft 365 or Entra admin center; disabling AD may not take effect in the cloud until directory synchronization finishes.'
+Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Revoke cloud sign-in sessions manually' -Status 'Attention' -Message 'This Graph-free branch cannot revoke existing cloud sessions. Revoke sessions in the Microsoft 365 or Entra admin center.'
 
 Write-Section 'Step 2 - remove Active Directory groups'
 
@@ -630,14 +575,18 @@ foreach ($Group in $ADGroups) {
     }
 }
 
-Write-Section 'Step 3 - remove Microsoft 365 group memberships'
+Write-Section 'Step 3 - remove Exchange Online group memberships'
 
 if ($SkipCloudGroupRemoval) {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove cloud group memberships' -Status 'Skipped' -Message 'SkipCloudGroupRemoval was specified.'
+    Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'Remove Exchange-manageable group memberships' -Status 'Skipped' -Message 'SkipCloudGroupRemoval was specified. Entra-only security groups still require manual review.'
 }
 else {
     foreach ($Failure in $DistributionGroupInspectionFailures) {
         Add-Result -System 'Exchange Online DL' -Item $Failure.Group -Action 'Inspect membership' -Status 'Attention' -Message $Failure.Message
+    }
+
+    foreach ($Failure in $Microsoft365GroupInspectionFailures) {
+        Add-Result -System 'Microsoft 365 Group' -Item $Failure.Group -Action 'Inspect membership and ownership' -Status 'Attention' -Message $Failure.Message
     }
 
     foreach ($Group in $CloudDistributionGroups) {
@@ -688,7 +637,9 @@ else {
                 if ($Plan.IsOwner) {
                     Remove-UnifiedGroupLinks -Identity $Plan.Identity -LinkType Owners -Links $EmployeeAddress -Confirm:$false -ErrorAction Stop
                 }
-                Remove-UnifiedGroupLinks -Identity $Plan.Identity -LinkType Members -Links $EmployeeAddress -Confirm:$false -ErrorAction Stop
+                if ($Plan.IsMember) {
+                    Remove-UnifiedGroupLinks -Identity $Plan.Identity -LinkType Members -Links $EmployeeAddress -Confirm:$false -ErrorAction Stop
+                }
 
                 $Message = if ($OnlyOwner) { "Ownership transferred to $ManagerAddress." } else { '' }
                 Add-Result -System 'Microsoft 365 Group' -Item $Group.DisplayName -Action 'Remove membership and ownership' -Status 'Completed' -Message $Message
@@ -703,33 +654,7 @@ else {
         }
     }
 
-    foreach ($Group in $CloudSecurityGroups) {
-        if ($Group.OnPremisesSyncEnabled) {
-            Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Skipped' -Message 'Directory-synchronized; the on-premises AD removal must synchronize to Microsoft Entra ID.'
-            continue
-        }
-        if ($Group.MembershipRule) {
-            Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Attention' -Message 'Dynamic group; membership cannot be removed manually. Review its rule, especially if it assigns licenses.'
-            continue
-        }
-        if ($Group.IsAssignableToRole) {
-            Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Attention' -Message 'Role-assignable group; remove with the appropriate privileged-role process.'
-            continue
-        }
-
-        if ($PSCmdlet.ShouldProcess($Group.DisplayName, "Remove $EmployeeAddress from the Microsoft Entra security group")) {
-            try {
-                Remove-MgGroupMemberByRef -GroupId $Group.Id -DirectoryObjectId $GraphUser.Id -Confirm:$false -ErrorAction Stop
-                Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Completed'
-            }
-            catch {
-                Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Failed' -Message $_.Exception.Message
-            }
-        }
-        else {
-            Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Preview'
-        }
-    }
+    Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Review cloud-only security-group memberships manually' -Status 'Attention' -Message 'This Graph-free branch cannot enumerate or remove non-mail-enabled Entra security groups, including dynamic and role-assignable groups. Review them in the Entra admin center.'
 }
 
 Write-Section 'Step 4 - convert mailbox and delegate the manager'
@@ -849,28 +774,16 @@ if ($LicenseBlockers.Count -gt 0) {
     Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'Review manual license removal' -Status 'Attention' -Message ($LicenseBlockers -join '; ')
 }
 
-Write-Section 'Step 5 - Microsoft 365 licenses (manual)'
+Write-Section 'Step 5 - review Microsoft 365 licenses manually'
 
-if ($DirectSkuIds.Count -eq 0) {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses manually' -Status 'Skipped' -Message 'No directly assigned licenses were found at preflight.'
-}
-elseif (-not $CreateSharedMailboxRequested) {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses manually' -Status 'Attention' -Message "$($DirectSkuIds.Count) directly assigned license(s) remain (SKU ID(s): $DirectSkuIdText). Shared mailbox was NO; manually removing an Exchange-bearing license can deprovision the mailbox, so follow the organization's retention decision and confirm the product name in the Admin Center."
+if (-not $CreateSharedMailboxRequested) {
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Review and remove licenses manually' -Status 'Attention' -Message "License assignments were not inventoried and no license-assignment API was called. Shared mailbox was NO; removing an Exchange-bearing license can deprovision the mailbox, so follow the organization's retention decision. Group cleanup may also revoke group-assigned licenses."
 }
 elseif (-not $ManualLicenseRemovalReady) {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses manually' -Status 'Attention' -Message "$($DirectSkuIds.Count) directly assigned license(s) remain (SKU ID(s): $DirectSkuIdText). Resolve the mailbox conversion, delegation, or licensing warnings, then confirm the intended product name in the Microsoft 365 Admin Center before manually removing it."
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Review and remove licenses manually' -Status 'Attention' -Message 'License assignments were not inventoried and no license-assignment API was called. Resolve the mailbox conversion, delegation, or licensing warnings before removing an Exchange-bearing license in the Microsoft 365 Admin Center. Group cleanup may also revoke group-assigned licenses.'
 }
 else {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses manually' -Status 'Attention' -Message "$($DirectSkuIds.Count) directly assigned license(s) remain (SKU ID(s): $DirectSkuIdText). This branch never directly changes license assignments; confirm the intended product name in the Microsoft 365 Admin Center and remove it manually after reviewing the audit log."
-}
-
-if ($InheritedLicenseStates.Count -gt 0) {
-    Add-Result `
-        -System 'Microsoft 365' `
-        -Item $EmployeeAddress `
-        -Action 'Verify group-inherited licenses' `
-        -Status 'Attention' `
-        -Message "$($InheritedLicenseStates.Count) group-inherited assignment state(s) existed at preflight. They remain until group removal and directory synchronization/licensing processing finish."
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Review and remove licenses manually' -Status 'Attention' -Message 'License assignments were not inventoried and no license-assignment API was called. Confirm the intended product and remove it manually in the Microsoft 365 Admin Center after reviewing the audit log. Group cleanup may also revoke group-assigned licenses.'
 }
 
 $LogDirectory = Split-Path -Parent $LogPath
