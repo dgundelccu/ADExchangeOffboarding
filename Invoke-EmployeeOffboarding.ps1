@@ -319,14 +319,48 @@ foreach ($Module in $RequiredModules) {
     }
 }
 
-# Load the Exchange Online and Microsoft Graph commands used below.
-# A missing-method or assembly-load error involving Graph authentication can point to incompatible
-# Graph/Exchange module versions, so inspect the full error before assuming the credentials are wrong.
-Import-Module ExchangeOnlineManagement -ErrorAction Stop
+# Load and authenticate Microsoft Graph before Exchange Online. Both modules include authentication
+# libraries, and loading Exchange first can make Graph bind to an incompatible library version.
 Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 Import-Module Microsoft.Graph.Users -ErrorAction Stop
 Import-Module Microsoft.Graph.Users.Actions -ErrorAction Stop
 Import-Module Microsoft.Graph.Groups -ErrorAction Stop
+
+# These are the delegated Graph permissions needed by the Graph actions in this script.
+# The signed-in account's Entra role and admin approval for these scopes are two separate requirements.
+$RequiredScopes = @(
+    'User.Read.All'
+    'User.EnableDisableAccount.All'
+    'User.RevokeSessions.All'
+    'LicenseAssignment.ReadWrite.All'
+    'GroupMember.ReadWrite.All'
+)
+
+# Check whether this process already has a Graph login with the right scopes and account.
+$GraphContext = Get-MgContext
+$MissingScopes = if ($GraphContext) {
+    @($RequiredScopes | Where-Object { $_ -notin $GraphContext.Scopes })
+}
+else {
+    @($RequiredScopes)
+}
+
+# Sign in again when the context is missing, not process-scoped, under-scoped, or using the wrong admin account.
+if (-not $GraphContext -or $GraphContext.ContextScope -ne 'Process' -or $MissingScopes.Count -gt 0 -or
+        ($GraphAdminUPN -and $GraphContext.Account -ine $GraphAdminUPN)) {
+    Connect-MgGraph -Scopes $RequiredScopes -ContextScope Process -NoWelcome -ErrorAction Stop | Out-Null
+    $GraphContext = Get-MgContext
+}
+
+# Never silently continue under a different Graph account when -GraphAdminUPN was supplied.
+if ($GraphAdminUPN -and $GraphContext.Account -ine $GraphAdminUPN) {
+    throw "Microsoft Graph connected as '$($GraphContext.Account)', but -GraphAdminUPN requires '$GraphAdminUPN'. Re-run and choose the required Graph administrator account during sign-in."
+}
+
+Write-Host "  Microsoft Graph account: $($GraphContext.Account)" -ForegroundColor Green
+
+# Graph is authenticated, so load Exchange only after Graph's authentication libraries are already in place.
+Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
 # A hybrid shared-mailbox conversion needs the on-premises Exchange object changed too.
 if ($CreateSharedMailboxRequested -and -not $CloudOnlyMailbox) {
@@ -383,39 +417,6 @@ catch {
     }
     Write-Host '  Connected to Exchange Online.' -ForegroundColor Green
 }
-
-# These are the delegated Graph permissions needed by the Graph actions in this script.
-# The signed-in account's Entra role and admin approval for these scopes are two separate requirements.
-$RequiredScopes = @(
-    'User.Read.All'
-    'User.EnableDisableAccount.All'
-    'User.RevokeSessions.All'
-    'LicenseAssignment.ReadWrite.All'
-    'GroupMember.ReadWrite.All'
-)
-
-# Check whether this process already has a Graph login with the right scopes and account.
-$GraphContext = Get-MgContext
-$MissingScopes = if ($GraphContext) {
-    @($RequiredScopes | Where-Object { $_ -notin $GraphContext.Scopes })
-}
-else {
-    @($RequiredScopes)
-}
-
-# Sign in again when the context is missing, stale, under-scoped, or using the wrong admin account.
-if (-not $GraphContext -or $GraphContext.ContextScope -ne 'Process' -or $MissingScopes.Count -gt 0 -or
-        ($GraphAdminUPN -and $GraphContext.Account -ine $GraphAdminUPN)) {
-    Connect-MgGraph -Scopes $RequiredScopes -ContextScope Process -NoWelcome -ErrorAction Stop | Out-Null
-    $GraphContext = Get-MgContext
-}
-
-# Never silently continue under a different Graph account when -GraphAdminUPN was supplied.
-if ($GraphAdminUPN -and $GraphContext.Account -ine $GraphAdminUPN) {
-    throw "Microsoft Graph connected as '$($GraphContext.Account)', but -GraphAdminUPN requires '$GraphAdminUPN'. Re-run and choose the required Graph administrator account during sign-in."
-}
-
-Write-Host "  Microsoft Graph account: $($GraphContext.Account)" -ForegroundColor Green
 
 # Resolve the employee and, when needed, the manager to their Exchange Online email addresses.
 $EmployeeEXO = Resolve-EXORecipient -ADUser $EmployeeAD -Role 'employee'
