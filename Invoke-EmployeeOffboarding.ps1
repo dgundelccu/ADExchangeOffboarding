@@ -41,8 +41,10 @@ param(
     [switch]$TransferSoleOwnedMicrosoft365GroupsToManager,
     # Skip direct cloud-group cleanup in Step 3; AD removals can still sync to directory-synchronized groups.
     [switch]$SkipCloudGroupRemoval,
-    # Keep all directly assigned licenses in place.
+    # Skip the Graph license-removal request entirely.
     [switch]$SkipLicenseRemoval,
+    # Optional advanced override. Normally the script asks you to choose the E3 product by name.
+    [guid]$LicenseSkuId,
     # Allow removal despite a hold, archive, large mailbox, or unknown size. Use this carefully.
     [switch]$OverrideSharedMailboxLicenseSafety,
     # Skip only the typed OFFBOARD prompt; this does not bypass -WhatIf, permissions, or safety gates.
@@ -83,6 +85,47 @@ while ($CreateSharedMailbox -notin @('YES', 'NO')) {
 $CreateSharedMailbox = $CreateSharedMailbox.ToUpperInvariant()
 $CreateSharedMailboxRequested = $CreateSharedMailbox -eq 'YES'
 $TerminationNote = 'TERM: {0:MM/dd/yyyy}' -f $TerminationDate
+
+# Keep the common E3 products behind friendly names so the BAT never needs an internal SKU GUID.
+$KnownLicenseSkus = [ordered]@{
+    '1' = [pscustomobject]@{ Name = 'Microsoft 365 E3';            PartNumber = 'SPE_E3';                        SkuId = [guid]'05e9a617-0261-4cee-bb44-138d3ef5d965' }
+    '2' = [pscustomobject]@{ Name = 'Office 365 E3';               PartNumber = 'ENTERPRISEPACK';                 SkuId = [guid]'6fd2c87f-b296-42f0-b197-1e91e994b900' }
+    '3' = [pscustomobject]@{ Name = 'Microsoft 365 E3 (no Teams)'; PartNumber = 'Microsoft_365_E3_(no_Teams)';    SkuId = [guid]'dcf0408c-aaec-446c-afd4-43e3683943ea' }
+    '4' = [pscustomobject]@{ Name = 'Office 365 E3 (no Teams)';    PartNumber = 'Office_365_E3_(no_Teams)';       SkuId = [guid]'46c3a859-c90d-40b3-9551-6178a48d5c18' }
+}
+$LicenseSkuName = 'Skipped'
+$LicenseSkuPartNumber = ''
+
+# If no advanced SKU override was supplied, ask for the exact product name shown in Microsoft 365.
+if (-not $SkipLicenseRemoval -and ($null -eq $LicenseSkuId -or $LicenseSkuId -eq [guid]::Empty)) {
+    while ($LicenseSkuName -eq 'Skipped' -and -not $SkipLicenseRemoval) {
+        Write-Host "`nLicense to remove:" -ForegroundColor Cyan
+        foreach ($ChoiceKey in $KnownLicenseSkus.Keys) {
+            Write-Host "  $ChoiceKey. $($KnownLicenseSkus[$ChoiceKey].Name) [$($KnownLicenseSkus[$ChoiceKey].PartNumber)]"
+        }
+        Write-Host '  S. Skip license removal for this run'
+
+        $LicenseChoice = (Read-Host 'Choose 1, 2, 3, 4, or S').Trim().ToUpperInvariant()
+        if ($LicenseChoice -eq 'S') {
+            $SkipLicenseRemoval = $true
+        }
+        elseif ($KnownLicenseSkus.Contains($LicenseChoice)) {
+            $LicenseSkuName = $KnownLicenseSkus[$LicenseChoice].Name
+            $LicenseSkuPartNumber = $KnownLicenseSkus[$LicenseChoice].PartNumber
+            $LicenseSkuId = $KnownLicenseSkus[$LicenseChoice].SkuId
+        }
+        else {
+            Write-Warning 'Choose 1, 2, 3, 4, or S.'
+        }
+    }
+}
+elseif (-not $SkipLicenseRemoval) {
+    $KnownLicenseMatch = $KnownLicenseSkus.Values |
+        Where-Object { $_.SkuId -eq $LicenseSkuId } |
+        Select-Object -First 1
+    $LicenseSkuName = if ($KnownLicenseMatch) { $KnownLicenseMatch.Name } else { 'Custom SKU supplied on the command line' }
+    $LicenseSkuPartNumber = if ($KnownLicenseMatch) { $KnownLicenseMatch.PartNumber } else { 'Not supplied' }
+}
 
 # Catch switch combinations that cannot make sense before any connections or changes happen.
 if (-not $CreateSharedMailboxRequested -and $CloudOnlyMailbox) {
@@ -131,6 +174,9 @@ function Add-AuditRecord {
         User                   = $script:User
         SharedMailboxRequested = $script:CreateSharedMailbox
         TerminationNote        = $script:TerminationNote
+        LicenseSkuName         = $script:LicenseSkuName
+        LicenseSkuPartNumber   = $script:LicenseSkuPartNumber
+        LicenseSkuId           = if ($script:SkipLicenseRemoval) { '' } else { $script:LicenseSkuId.ToString() }
         System                 = $System
         Item                   = $Item
         Action                 = $Action
@@ -194,7 +240,7 @@ function Resolve-EXORecipient {
 
     foreach ($Candidate in $Candidates) {
         try {
-            return Get-EXORecipient -Identity $Candidate -Properties PrimarySmtpAddress, RecipientTypeDetails -ErrorAction Stop
+            return Get-EXORecipient -Identity $Candidate -Properties PrimarySmtpAddress, RecipientTypeDetails, ExternalDirectoryObjectId -ErrorAction Stop
         }
         catch {
             # This address did not resolve, so try the user's other known address before giving up.
@@ -307,11 +353,13 @@ if ($ManagerRequired) {
 # Confirm every PowerShell module is installed before trying to import any of them.
 $RequiredModules = @(
     'ExchangeOnlineManagement'
-    'Microsoft.Graph.Authentication'
-    'Microsoft.Graph.Users'
-    'Microsoft.Graph.Users.Actions'
-    'Microsoft.Graph.Groups'
 )
+if (-not $SkipLicenseRemoval) {
+    $RequiredModules += @(
+        'Microsoft.Graph.Authentication'
+        'Microsoft.Graph.Users.Actions'
+    )
+}
 
 foreach ($Module in $RequiredModules) {
     if (-not (Get-Module -ListAvailable -Name $Module)) {
@@ -319,47 +367,40 @@ foreach ($Module in $RequiredModules) {
     }
 }
 
-# Load and authenticate Microsoft Graph before Exchange Online. Both modules include authentication
-# libraries, and loading Exchange first can make Graph bind to an incompatible library version.
-Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-Import-Module Microsoft.Graph.Users -ErrorAction Stop
-Import-Module Microsoft.Graph.Users.Actions -ErrorAction Stop
-Import-Module Microsoft.Graph.Groups -ErrorAction Stop
+# Graph is optional. When licenses are skipped, this run never imports or connects to Graph.
+if (-not $SkipLicenseRemoval) {
+    # Authenticate Graph before loading Exchange because the modules can otherwise load conflicting libraries.
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    Import-Module Microsoft.Graph.Users.Actions -ErrorAction Stop
 
-# These are the delegated Graph permissions needed by the Graph actions in this script.
-# The signed-in account's Entra role and admin approval for these scopes are two separate requirements.
-$RequiredScopes = @(
-    'User.Read.All'
-    'User.EnableDisableAccount.All'
-    'User.RevokeSessions.All'
-    'LicenseAssignment.ReadWrite.All'
-    'GroupMember.ReadWrite.All'
-)
+    # This is the only Graph data permission requested by this script.
+    $RequiredScopes = @('LicenseAssignment.ReadWrite.All')
 
-# Check whether this process already has a Graph login with the right scopes and account.
-$GraphContext = Get-MgContext
-$MissingScopes = if ($GraphContext) {
-    @($RequiredScopes | Where-Object { $_ -notin $GraphContext.Scopes })
-}
-else {
-    @($RequiredScopes)
-}
-
-# Sign in again when the context is missing, not process-scoped, under-scoped, or using the wrong admin account.
-if (-not $GraphContext -or $GraphContext.ContextScope -ne 'Process' -or $MissingScopes.Count -gt 0 -or
-        ($GraphAdminUPN -and $GraphContext.Account -ine $GraphAdminUPN)) {
-    Connect-MgGraph -Scopes $RequiredScopes -ContextScope Process -NoWelcome -ErrorAction Stop | Out-Null
     $GraphContext = Get-MgContext
+    $MissingScopes = if ($GraphContext) {
+        @($RequiredScopes | Where-Object { $_ -notin $GraphContext.Scopes })
+    }
+    else {
+        @($RequiredScopes)
+    }
+
+    # Reuse only a process-scoped login with the requested license permission and expected account.
+    if (-not $GraphContext -or $GraphContext.ContextScope -ne 'Process' -or $MissingScopes.Count -gt 0 -or
+            ($GraphAdminUPN -and $GraphContext.Account -ine $GraphAdminUPN)) {
+        Connect-MgGraph -Scopes $RequiredScopes -ContextScope Process -NoWelcome -ErrorAction Stop | Out-Null
+        $GraphContext = Get-MgContext
+    }
+
+    # Never silently continue under a different Graph account when -GraphAdminUPN was supplied.
+    if ($GraphAdminUPN -and $GraphContext.Account -ine $GraphAdminUPN) {
+        throw "Microsoft Graph connected as '$($GraphContext.Account)', but -GraphAdminUPN requires '$GraphAdminUPN'. Re-run and choose the required Graph administrator account during sign-in."
+    }
+
+    Write-Host "  Microsoft Graph account: $($GraphContext.Account) (license removal only)" -ForegroundColor Green
+    Write-Host "  Graph token scopes: $(@($GraphContext.Scopes | Sort-Object) -join ', ')" -ForegroundColor Gray
 }
 
-# Never silently continue under a different Graph account when -GraphAdminUPN was supplied.
-if ($GraphAdminUPN -and $GraphContext.Account -ine $GraphAdminUPN) {
-    throw "Microsoft Graph connected as '$($GraphContext.Account)', but -GraphAdminUPN requires '$GraphAdminUPN'. Re-run and choose the required Graph administrator account during sign-in."
-}
-
-Write-Host "  Microsoft Graph account: $($GraphContext.Account)" -ForegroundColor Green
-
-# Graph is authenticated, so load Exchange only after Graph's authentication libraries are already in place.
+# Load Exchange after the optional Graph login so their authentication libraries do not collide.
 Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
 # A hybrid shared-mailbox conversion needs the on-premises Exchange object changed too.
@@ -421,27 +462,20 @@ catch {
 # Resolve the employee and, when needed, the manager to their Exchange Online email addresses.
 $EmployeeEXO = Resolve-EXORecipient -ADUser $EmployeeAD -Role 'employee'
 $EmployeeAddress = Get-NormalizedAddress $EmployeeEXO.PrimarySmtpAddress
+$EmployeeCloudObjectId = [guid]::Empty
+$EmployeeCloudObjectIdProperty = $EmployeeEXO.PSObject.Properties['ExternalDirectoryObjectId']
+$HasEmployeeCloudObjectId = $false
+if ($EmployeeCloudObjectIdProperty -and $EmployeeCloudObjectIdProperty.Value) {
+    $HasEmployeeCloudObjectId = [guid]::TryParse($EmployeeCloudObjectIdProperty.Value.ToString(), [ref]$EmployeeCloudObjectId)
+}
+if ((($CreateSharedMailboxRequested -and $CloudOnlyMailbox) -or (-not $SkipLicenseRemoval)) -and -not $HasEmployeeCloudObjectId) {
+    throw "Exchange Online did not return a valid Microsoft Entra object ID for '$EmployeeAddress'. The script cannot safely verify cloud-only status or target the license removal."
+}
 $ManagerEXO = $null
 $ManagerAddress = $null
 if ($ManagerRequired) {
     $ManagerEXO = Resolve-EXORecipient -ADUser $ManagerAD -Role 'manager'
     $ManagerAddress = Get-NormalizedAddress $ManagerEXO.PrimarySmtpAddress
-}
-
-# Pull the employee's Entra account status, sync state, and license assignment details.
-try {
-    $GraphUser = Get-MgUser `
-        -UserId $EmployeeAD.UserPrincipalName `
-        -Property Id, DisplayName, UserPrincipalName, AccountEnabled, OnPremisesSyncEnabled, AssignedLicenses, LicenseAssignmentStates `
-        -ErrorAction Stop
-}
-catch {
-    throw "Could not resolve '$($EmployeeAD.UserPrincipalName)' in Microsoft Graph: $($_.Exception.Message)"
-}
-
-# A synced user must be converted on-premises too, or the next directory sync can undo the cloud-only change.
-if ($CreateSharedMailboxRequested -and $CloudOnlyMailbox -and $GraphUser.OnPremisesSyncEnabled) {
-    throw "-CloudOnlyMailbox cannot be used because '$($GraphUser.UserPrincipalName)' is directory-synchronized. Supply -OnPremExchangeServer so both mailbox objects are converted safely."
 }
 
 # Inspect mailbox type, hold/archive state, and size before deciding whether license removal is safe.
@@ -454,6 +488,28 @@ try {
 }
 catch {
     throw "Could not resolve and inspect the employee mailbox: $($_.Exception.Message)"
+}
+
+# A cloud-only conversion is allowed only when Exchange explicitly confirms that the mailbox is not synced.
+if ($CreateSharedMailboxRequested -and $CloudOnlyMailbox) {
+    try {
+        $MailboxDirectoryMatches = @(Get-User -Filter "ExternalDirectoryObjectId -eq '$($EmployeeCloudObjectId.ToString())'" -ResultSize 2 -ErrorAction Stop)
+        if ($MailboxDirectoryMatches.Count -ne 1) {
+            throw "Expected one Exchange Online user for Entra object ID '$EmployeeCloudObjectId', but found $($MailboxDirectoryMatches.Count)."
+        }
+        $MailboxDirectoryState = $MailboxDirectoryMatches[0]
+    }
+    catch {
+        throw "Could not verify whether '$EmployeeAddress' is directory-synchronized: $($_.Exception.Message)"
+    }
+
+    $IsDirSyncedProperty = $MailboxDirectoryState.PSObject.Properties['IsDirSynced']
+    if (-not $IsDirSyncedProperty -or $IsDirSyncedProperty.Value -isnot [bool]) {
+        throw '-CloudOnlyMailbox cannot be used because Exchange Online did not return a definite directory-synchronization state. Supply -OnPremExchangeServer so both mailbox objects are converted safely.'
+    }
+    if ($IsDirSyncedProperty.Value) {
+        throw "-CloudOnlyMailbox cannot be used because '$EmployeeAddress' is directory-synchronized. Supply -OnPremExchangeServer so both mailbox objects are converted safely."
+    }
 }
 
 # For a hybrid conversion, also pull the on-premises remote-mailbox object we will verify later.
@@ -475,12 +531,11 @@ catch {
     throw "Could not enumerate the employee's Active Directory groups: $($_.Exception.Message)"
 }
 
-# Separate direct licenses, which the script can remove, from group-inherited licenses, which need follow-up.
-$DirectSkuIds = @($GraphUser.LicenseAssignmentStates |
-    Where-Object { -not $_.AssignedByGroup } |
-    ForEach-Object { $_.SkuId } |
-    Sort-Object -Unique)
-$InheritedLicenseStates = @($GraphUser.LicenseAssignmentStates | Where-Object { $_.AssignedByGroup })
+# Use only the exact SKU GUID supplied by the operator. No separate Graph profile or license-inventory GET is made.
+$DirectSkuIds = @()
+if (-not $SkipLicenseRemoval) {
+    $DirectSkuIds = @($LicenseSkuId.ToString())
+}
 
 # Build a list of mailbox conditions that normally make license removal unsafe.
 $MailboxSizeBytes = ConvertTo-ByteCount $MailboxStatistics.TotalItemSize
@@ -504,11 +559,11 @@ if ($CreateSharedMailboxRequested) {
 $CloudDistributionGroups = [System.Collections.Generic.List[object]]::new()
 $DistributionGroupInspectionFailures = [System.Collections.Generic.List[object]]::new()
 $Microsoft365GroupPlans = [System.Collections.Generic.List[object]]::new()
-$CloudSecurityGroups = @()
+$Microsoft365GroupInspectionFailures = [System.Collections.Generic.List[object]]::new()
 
 # Cloud-group discovery can be slow because Exchange checks every distribution group for membership.
 if (-not $SkipCloudGroupRemoval) {
-    Write-Host '  Inspecting Exchange Online and Microsoft Entra group memberships...' -ForegroundColor Gray
+    Write-Host '  Inspecting Exchange Online group memberships...' -ForegroundColor Gray
 
     # Find cloud-managed distribution groups where this employee is actually a member.
     try {
@@ -533,48 +588,50 @@ if (-not $SkipCloudGroupRemoval) {
         throw "Could not enumerate Exchange Online distribution groups: $($_.Exception.Message)"
     }
 
-    # Graph returns the employee's Entra and Microsoft 365 group memberships in one call.
+    # Exchange Online can find Microsoft 365 groups without asking Graph for group permissions.
     try {
-        $GraphGroups = @(Get-MgUserMemberOfAsGroup `
-            -UserId $GraphUser.Id `
-            -All `
-            -Property Id, DisplayName, Mail, GroupTypes, MailEnabled, SecurityEnabled, OnPremisesSyncEnabled, MembershipRule, IsAssignableToRole, AssignedLicenses `
-            -ErrorAction Stop)
+        $Microsoft365Groups = @(Get-UnifiedGroup -ResultSize Unlimited -ErrorAction Stop)
     }
     catch {
-        throw "Could not enumerate the employee's Microsoft Entra group memberships: $($_.Exception.Message)"
+        throw "Could not enumerate Exchange Online Microsoft 365 groups: $($_.Exception.Message)"
     }
 
-    # Keep non-mail-enabled security groups separate because Graph removes those memberships.
-    $CloudSecurityGroups = @($GraphGroups | Where-Object {
-        $_.SecurityEnabled -and -not $_.MailEnabled -and @($_.GroupTypes) -notcontains 'Unified'
-    })
-
     # For Microsoft 365 groups, check ownership and whether the manager is already a member or owner.
-    foreach ($Group in @($GraphGroups | Where-Object { @($_.GroupTypes) -contains 'Unified' })) {
+    foreach ($Group in $Microsoft365Groups) {
         try {
-            $GroupIdentity = Get-NormalizedAddress $Group.Mail
+            $GroupIdentity = Get-NormalizedAddress $Group.PrimarySmtpAddress
             if (-not $GroupIdentity) {
-                throw 'Microsoft Graph did not return the group mail address required by Exchange Online.'
+                throw 'Exchange Online did not return a primary SMTP address for the group.'
             }
 
             $Owners = @(Get-UnifiedGroupLinks -Identity $GroupIdentity -LinkType Owners -ResultSize Unlimited -ErrorAction Stop)
             $Members = @(Get-UnifiedGroupLinks -Identity $GroupIdentity -LinkType Members -ResultSize Unlimited -ErrorAction Stop)
             $IsOwner = @($Owners | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $EmployeeAddress }).Count -gt 0
-            $ManagerIsMember = @($Members | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $ManagerAddress }).Count -gt 0
-            $ManagerIsOwner = @($Owners | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $ManagerAddress }).Count -gt 0
+            $IsMember = @($Members | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $EmployeeAddress }).Count -gt 0
+            if (-not $IsOwner -and -not $IsMember) { continue }
+
+            $ManagerIsMember = $false
+            $ManagerIsOwner = $false
+            if ($ManagerAddress) {
+                $ManagerIsMember = @($Members | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $ManagerAddress }).Count -gt 0
+                $ManagerIsOwner = @($Owners | Where-Object { (Get-NormalizedAddress $_.PrimarySmtpAddress) -eq $ManagerAddress }).Count -gt 0
+            }
 
             $Microsoft365GroupPlans.Add([pscustomobject]@{
                 Group           = $Group
                 Identity        = $GroupIdentity
                 Owners          = $Owners
                 IsOwner         = $IsOwner
+                IsMember        = $IsMember
                 ManagerIsMember = $ManagerIsMember
                 ManagerIsOwner  = $ManagerIsOwner
             })
         }
         catch {
-            throw "Could not inspect Microsoft 365 group '$($Group.DisplayName)': $($_.Exception.Message)"
+            $Microsoft365GroupInspectionFailures.Add([pscustomobject]@{
+                Group   = $Group.DisplayName
+                Message = $_.Exception.Message
+            })
         }
     }
 }
@@ -593,25 +650,48 @@ Write-Host "AD Notes : $TerminationNote" -ForegroundColor White
 Write-Host "Keep AD  : $($KeepADGroups -join ', ')" -ForegroundColor White
 Write-Host "AD groups: $($ADGroups.Count) direct membership(s) found" -ForegroundColor White
 if (-not $SkipCloudGroupRemoval) {
-    Write-Host "Cloud    : $($CloudDistributionGroups.Count) distribution, $($Microsoft365GroupPlans.Count) Microsoft 365, $($CloudSecurityGroups.Count) security group membership(s) found" -ForegroundColor White
+    Write-Host "Exchange : $($CloudDistributionGroups.Count) distribution and $($Microsoft365GroupPlans.Count) Microsoft 365 group membership/ownership record(s) found" -ForegroundColor White
+    Write-Warning 'Cloud-only, non-mail-enabled Microsoft Entra security groups are not inspected because this script no longer requests Graph group permission.'
 }
-Write-Host "Licenses : $($DirectSkuIds.Count) direct; $($InheritedLicenseStates.Count) group-inherited assignment state(s)" -ForegroundColor White
-if ($CreateSharedMailboxRequested) {
-    Write-Host 'Mailbox action: convert to shared, grant the AD manager Full Access, then remove eligible licenses.' -ForegroundColor Yellow
+if ($DistributionGroupInspectionFailures.Count -gt 0) {
+    Write-Warning "Preflight could not inspect $($DistributionGroupInspectionFailures.Count) Exchange distribution group(s): $(@($DistributionGroupInspectionFailures.Group) -join ', '). These will be flagged for follow-up."
+}
+if ($Microsoft365GroupInspectionFailures.Count -gt 0) {
+    Write-Warning "Preflight could not inspect $($Microsoft365GroupInspectionFailures.Count) Microsoft 365 group(s): $(@($Microsoft365GroupInspectionFailures.Group) -join ', '). These will be flagged for follow-up."
+}
+if ($SkipLicenseRemoval) {
+    Write-Host 'Licenses : skipped; Microsoft Graph will not be loaded or connected' -ForegroundColor Gray
+}
+else {
+    Write-Host "License  : $LicenseSkuName [$LicenseSkuPartNumber]" -ForegroundColor White
+    Write-Host "SKU GUID : $($DirectSkuIds[0])" -ForegroundColor White
+    Write-Warning 'Graph will only submit removal of this selected product. No separate profile or license-inventory GET is made, so the script cannot distinguish direct from group-assigned licensing.'
+}
+if ($CreateSharedMailboxRequested -and -not $SkipLicenseRemoval) {
+    Write-Host 'Mailbox action: convert to shared, grant the AD manager Full Access, then remove the selected license when the safety checks pass.' -ForegroundColor Yellow
+}
+elseif ($CreateSharedMailboxRequested) {
+    Write-Host 'Mailbox action: convert to shared and grant the AD manager Full Access. License removal is skipped.' -ForegroundColor Yellow
 }
 else {
     Write-Warning 'Shared mailbox is NO. The script will not convert or delegate the mailbox. Removing its Exchange license can deprovision the mailbox according to your retention policy.'
 }
 
 # Surface any license blockers before the operator confirms the live run.
-if ($LicenseBlockers.Count -gt 0) {
+if (-not $SkipLicenseRemoval -and $LicenseBlockers.Count -gt 0) {
     Write-Warning "License safety check: $($LicenseBlockers -join '; '). License removal will be blocked unless -OverrideSharedMailboxLicenseSafety is explicitly supplied."
 }
 
 # A live run requires the exact typed phrase unless -Force was intentionally supplied.
 # -WhatIf skips this prompt because it cannot make the listed directory or mailbox changes.
 if (-not $Force -and -not $WhatIfPreference) {
-    $Answer = Read-Host "Continue? Type OFFBOARD $User to make these changes"
+    $ConfirmationPrompt = if ($SkipLicenseRemoval) {
+        "Continue? Type OFFBOARD $User to make these changes"
+    }
+    else {
+        "Confirm $LicenseSkuName [$LicenseSkuPartNumber / $($DirectSkuIds[0])] is correct. Then type OFFBOARD $User"
+    }
+    $Answer = Read-Host $ConfirmationPrompt
     if ($Answer -cne "OFFBOARD $User") {
         Write-Host 'Cancelled. No changes were made.' -ForegroundColor Yellow
         return
@@ -619,7 +699,7 @@ if (-not $Force -and -not $WhatIfPreference) {
 }
 
 # From this point on, employee changes use ShouldProcess, so -WhatIf records Preview instead of changing them.
-Write-Section 'Step 1 - disable sign-in and revoke sessions'
+Write-Section 'Step 1 - disable the Active Directory account'
 
 # Disable the on-premises AD account first. Already-disabled accounts are safe to rerun.
 if (-not $EmployeeAD.Enabled) {
@@ -659,36 +739,9 @@ else {
     Add-Result -System 'Active Directory' -Item $User -Action 'Set AD Notes termination marker' -Status 'Preview' -Message $TerminationNote
 }
 
-# Block Entra sign-in too so cloud access does not have to wait for directory synchronization.
-if ($GraphUser.AccountEnabled -eq $false) {
-    Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Block cloud sign-in' -Status 'Skipped' -Message 'Cloud sign-in is already blocked.'
-}
-elseif ($PSCmdlet.ShouldProcess($EmployeeAddress, 'Block Microsoft Entra ID sign-in')) {
-    try {
-        Update-MgUser -UserId $GraphUser.Id -AccountEnabled:$false -ErrorAction Stop
-        Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Block cloud sign-in' -Status 'Completed'
-    }
-    catch {
-        Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Block cloud sign-in' -Status 'Failed' -Message $_.Exception.Message
-    }
-}
-else {
-    Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Block cloud sign-in' -Status 'Preview'
-}
-
-# Revoke refresh tokens and session cookies. Already-issued access tokens can remain valid until they expire.
-if ($PSCmdlet.ShouldProcess($EmployeeAddress, 'Revoke Microsoft 365 sign-in sessions')) {
-    try {
-        Revoke-MgUserSignInSession -UserId $GraphUser.Id -ErrorAction Stop | Out-Null
-        Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Revoke sign-in sessions' -Status 'Completed'
-    }
-    catch {
-        Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Revoke sign-in sessions' -Status 'Failed' -Message $_.Exception.Message
-    }
-}
-else {
-    Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Revoke sign-in sessions' -Status 'Preview'
-}
+# These identity actions stay outside this script so Graph never asks for user/session permissions.
+Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Confirm cloud sign-in is blocked' -Status 'Attention' -Message 'This script disables AD but does not request Graph permission to block Entra sign-in. Confirm the separate offboarding process completed this action.'
+Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Confirm cloud sessions are revoked' -Status 'Attention' -Message 'This script does not request Graph session permission. Confirm the separate offboarding process revoked the user sessions.'
 
 Write-Section 'Step 2 - remove Active Directory groups'
 
@@ -717,16 +770,19 @@ foreach ($Group in $ADGroups) {
     }
 }
 
-Write-Section 'Step 3 - remove Microsoft 365 group memberships'
+Write-Section 'Step 3 - remove Exchange Online group memberships'
 
 # This switch skips all cloud-group writes but leaves the rest of the offboarding run available.
 if ($SkipCloudGroupRemoval) {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove cloud group memberships' -Status 'Skipped' -Message 'SkipCloudGroupRemoval was specified.'
+    Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'Remove Exchange-manageable group memberships' -Status 'Skipped' -Message 'SkipCloudGroupRemoval was specified.'
 }
 else {
     # Memberships that could not be inspected stay visible as follow-up items in the audit.
     foreach ($Failure in $DistributionGroupInspectionFailures) {
         Add-Result -System 'Exchange Online DL' -Item $Failure.Group -Action 'Inspect membership' -Status 'Attention' -Message $Failure.Message
+    }
+    foreach ($Failure in $Microsoft365GroupInspectionFailures) {
+        Add-Result -System 'Microsoft 365 Group' -Item $Failure.Group -Action 'Inspect membership and ownership' -Status 'Attention' -Message $Failure.Message
     }
 
     # Remove the employee from cloud-managed distribution and mail-enabled security groups.
@@ -782,7 +838,9 @@ else {
                 if ($Plan.IsOwner) {
                     Remove-UnifiedGroupLinks -Identity $Plan.Identity -LinkType Owners -Links $EmployeeAddress -Confirm:$false -ErrorAction Stop
                 }
-                Remove-UnifiedGroupLinks -Identity $Plan.Identity -LinkType Members -Links $EmployeeAddress -Confirm:$false -ErrorAction Stop
+                if ($Plan.IsMember) {
+                    Remove-UnifiedGroupLinks -Identity $Plan.Identity -LinkType Members -Links $EmployeeAddress -Confirm:$false -ErrorAction Stop
+                }
 
                 $Message = if ($OnlyOwner) { "Ownership transferred to $ManagerAddress." } else { '' }
                 Add-Result -System 'Microsoft 365 Group' -Item $Group.DisplayName -Action 'Remove membership and ownership' -Status 'Completed' -Message $Message
@@ -797,39 +855,10 @@ else {
         }
     }
 
-    # Non-mail-enabled Entra security groups need Graph rather than Exchange cmdlets.
-    foreach ($Group in $CloudSecurityGroups) {
-        # Synced memberships must be managed on-premises; any AD-side removal then flows up through synchronization.
-        if ($Group.OnPremisesSyncEnabled) {
-            Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Skipped' -Message 'Directory-synchronized; the on-premises AD removal must synchronize to Microsoft Entra ID.'
-            continue
-        }
-        # Dynamic membership comes from a rule, so there is no direct membership to remove.
-        if ($Group.MembershipRule) {
-            Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Attention' -Message 'Dynamic group; membership cannot be removed manually. Review its rule, especially if it assigns licenses.'
-            continue
-        }
-        # Role-assignable groups use a more privileged process and are left for manual review.
-        if ($Group.IsAssignableToRole) {
-            Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Attention' -Message 'Role-assignable group; remove with the appropriate privileged-role process.'
-            continue
-        }
-
-        # Static cloud-only security groups can be removed directly through Graph.
-        if ($PSCmdlet.ShouldProcess($Group.DisplayName, "Remove $EmployeeAddress from the Microsoft Entra security group")) {
-            try {
-                Remove-MgGroupMemberByRef -GroupId $Group.Id -DirectoryObjectId $GraphUser.Id -Confirm:$false -ErrorAction Stop
-                Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Completed'
-            }
-            catch {
-                Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Failed' -Message $_.Exception.Message
-            }
-        }
-        else {
-            Add-Result -System 'Microsoft Entra security group' -Item $Group.DisplayName -Action 'Remove membership' -Status 'Preview'
-        }
-    }
 }
+
+# Non-mail-enabled Entra groups cannot be inspected through Exchange Online.
+Add-Result -System 'Microsoft Entra ID' -Item $EmployeeAddress -Action 'Confirm Entra-only security groups were reviewed' -Status 'Attention' -Message 'This script does not request Graph group permission. Confirm the separate offboarding process reviewed cloud-only, dynamic, and role-assignable security groups.'
 
 Write-Section 'Step 4 - convert mailbox and delegate the manager'
 
@@ -866,7 +895,14 @@ elseif ($PSCmdlet.ShouldProcess($User, 'Convert the on-premises remote mailbox t
     }
 }
 else {
-    Add-Result -System 'On-premises Exchange' -Item $User -Action 'Convert remote mailbox to shared' -Status 'Preview'
+    if ($WhatIfPreference) {
+        Add-Result -System 'On-premises Exchange' -Item $User -Action 'Convert remote mailbox to shared' -Status 'Preview'
+    }
+    else {
+        $OnPremMailboxReady = $false
+        $CanRemoveLicenses = $false
+        Add-Result -System 'On-premises Exchange' -Item $User -Action 'Convert remote mailbox to shared' -Status 'Attention' -Message 'Operator declined the conversion, so cloud conversion and license removal were blocked.'
+    }
 }
 
 # Do not convert the cloud mailbox if the hybrid source-of-authority change failed.
@@ -893,7 +929,13 @@ elseif ($PSCmdlet.ShouldProcess($EmployeeAddress, 'Convert the Exchange Online m
     }
 }
 else {
-    Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'Convert to shared mailbox' -Status 'Preview'
+    if ($WhatIfPreference) {
+        Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'Convert to shared mailbox' -Status 'Preview'
+    }
+    else {
+        $CanRemoveLicenses = $false
+        Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'Convert to shared mailbox' -Status 'Attention' -Message 'Operator declined the conversion, so license removal was blocked.'
+    }
 }
 
 # Full Access is required for the manager. A failure here also blocks license removal.
@@ -922,7 +964,13 @@ try {
         Add-Result -System 'Exchange Online' -Item $ManagerAddress -Action 'Grant mailbox Full Access' -Status 'Completed'
     }
     else {
-        Add-Result -System 'Exchange Online' -Item $ManagerAddress -Action 'Grant mailbox Full Access' -Status 'Preview'
+        if ($WhatIfPreference) {
+            Add-Result -System 'Exchange Online' -Item $ManagerAddress -Action 'Grant mailbox Full Access' -Status 'Preview'
+        }
+        else {
+            $CanRemoveLicenses = $false
+            Add-Result -System 'Exchange Online' -Item $ManagerAddress -Action 'Grant mailbox Full Access' -Status 'Attention' -Message 'Operator declined Full Access, so license removal was blocked.'
+        }
     }
 }
 catch {
@@ -955,15 +1003,17 @@ if ($GrantSendAs) {
 }
 
 # Apply the mailbox hold/archive/size safety gate after conversion and delegation results are known.
-if ($LicenseBlockers.Count -gt 0 -and -not $OverrideSharedMailboxLicenseSafety) {
-    $CanRemoveLicenses = $false
-    Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'License safety check' -Status 'Attention' -Message ($LicenseBlockers -join '; ')
-}
-elseif ($LicenseBlockers.Count -gt 0) {
-    Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'License safety check' -Status 'Attention' -Message ("Override supplied for: " + ($LicenseBlockers -join '; '))
+if (-not $SkipLicenseRemoval) {
+    if ($LicenseBlockers.Count -gt 0 -and -not $OverrideSharedMailboxLicenseSafety) {
+        $CanRemoveLicenses = $false
+        Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'License safety check' -Status 'Attention' -Message ($LicenseBlockers -join '; ')
+    }
+    elseif ($LicenseBlockers.Count -gt 0) {
+        Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'License safety check' -Status 'Attention' -Message ("Override supplied for: " + ($LicenseBlockers -join '; '))
+    }
 }
 
-Write-Section 'Step 5 - remove Microsoft 365 licenses'
+Write-Section 'Step 5 - remove the selected Microsoft 365 license'
 
 # License removal can be skipped directly or blocked automatically by an earlier safety failure.
 if ($SkipLicenseRemoval) {
@@ -973,40 +1023,57 @@ elseif (-not $CanRemoveLicenses) {
     Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove licenses' -Status 'Attention' -Message 'Safety gate blocked removal; resolve mailbox conversion, delegation, or licensing warnings first.'
 }
 elseif ($DirectSkuIds.Count -eq 0) {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses' -Status 'Skipped' -Message 'No directly assigned licenses found.'
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove selected license' -Status 'Attention' -Message 'No license product was selected, so no Graph license request was sent.'
 }
-# Remove every directly assigned SKU found during preflight, then query Graph again to verify none remain.
-elseif ($PSCmdlet.ShouldProcess($EmployeeAddress, "Remove $($DirectSkuIds.Count) directly assigned Microsoft 365 license(s)")) {
+# Submit only the selected SKU GUID; no Graph user-profile or license-inventory read is made.
+elseif ($PSCmdlet.ShouldProcess($EmployeeAddress, "Remove $LicenseSkuName [$($DirectSkuIds[0])]")) {
     try {
-        Set-MgUserLicense -UserId $GraphUser.Id -AddLicenses @() -RemoveLicenses $DirectSkuIds -ErrorAction Stop | Out-Null
+        $LicenseRemovalResult = Set-MgUserLicense `
+            -UserId $EmployeeCloudObjectId.ToString() `
+            -AddLicenses @() `
+            -RemoveLicenses $DirectSkuIds `
+            -ErrorAction Stop
 
-        $VerifiedGraphUser = Get-MgUser -UserId $GraphUser.Id -Property LicenseAssignmentStates -ErrorAction Stop
-        $RemainingDirectSkuIds = @($VerifiedGraphUser.LicenseAssignmentStates |
-            Where-Object { -not $_.AssignedByGroup } |
-            ForEach-Object { $_.SkuId } |
-            Sort-Object -Unique)
-        if ($RemainingDirectSkuIds.Count -gt 0) {
-            throw "$($RemainingDirectSkuIds.Count) directly assigned license(s) remain after the removal request."
+        $AssignedLicensesProperty = if ($null -ne $LicenseRemovalResult) {
+            $LicenseRemovalResult.PSObject.Properties['AssignedLicenses']
+        }
+        else {
+            $null
         }
 
-        Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses' -Status 'Completed' -Message "$($DirectSkuIds.Count) license(s) removed and verified."
+        if (-not $AssignedLicensesProperty -or $null -eq $AssignedLicensesProperty.Value) {
+            Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action "Remove $LicenseSkuName" -Status 'Attention' -Message 'Graph accepted the request, but its response did not include assigned-license state. Verify the result in the Microsoft 365 admin center.'
+        }
+        else {
+            $RemainingTargetSkuIds = @(
+                foreach ($AssignedLicense in @($AssignedLicensesProperty.Value)) {
+                    $SkuIdProperty = $AssignedLicense.PSObject.Properties['SkuId']
+                    if ($SkuIdProperty -and $SkuIdProperty.Value) {
+                        $AssignedSkuId = $SkuIdProperty.Value.ToString()
+                        if ($AssignedSkuId -in $DirectSkuIds) { $AssignedSkuId }
+                    }
+                }
+            )
+
+            if ($RemainingTargetSkuIds.Count -gt 0) {
+                Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action "Remove $LicenseSkuName" -Status 'Attention' -Message "Graph accepted the request, but its response still lists the selected SKU. It may also be group-assigned; verify it manually."
+            }
+            else {
+                Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action "Remove $LicenseSkuName" -Status 'Completed' -Message "Graph's response no longer lists the selected SKU."
+            }
+        }
     }
     catch {
-        Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses' -Status 'Failed' -Message $_.Exception.Message
+        Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action "Remove $LicenseSkuName" -Status 'Failed' -Message $_.Exception.Message
     }
 }
 else {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses' -Status 'Preview' -Message "$($DirectSkuIds.Count) license(s)."
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action "Remove $LicenseSkuName" -Status 'Preview' -Message $DirectSkuIds[0]
 }
 
-# Group-inherited licensing is not directly removable here; it clears only after group cleanup and processing.
-if ($InheritedLicenseStates.Count -gt 0) {
-    Add-Result `
-        -System 'Microsoft 365' `
-        -Item $EmployeeAddress `
-        -Action 'Verify group-inherited licenses' `
-        -Status 'Attention' `
-        -Message "$($InheritedLicenseStates.Count) group-inherited assignment state(s) existed at preflight. They remain until group removal and directory synchronization/licensing processing finish."
+# A write-only Graph scope cannot independently inventory direct versus inherited licenses.
+if (-not $SkipLicenseRemoval) {
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Verify final license assignments' -Status 'Attention' -Message 'Confirm the intended product was removed and check for group-assigned licenses after directory synchronization and licensing processing finish.'
 }
 
 # Create a custom log folder when needed, then write every result to the CSV.
