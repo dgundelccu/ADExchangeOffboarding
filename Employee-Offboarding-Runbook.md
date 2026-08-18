@@ -1,5 +1,7 @@
 # Employee offboarding script
 
+This branch intentionally never directly changes Microsoft 365 license assignments through Graph. Direct license SKU IDs are written to the audit, but the operator must confirm the product name and remove the intended direct license manually in the Microsoft 365 Admin Center. Group cleanup can still revoke group-inherited licenses.
+
 Keep these files in the same folder:
 
 - `Invoke-EmployeeOffboarding.ps1`
@@ -15,7 +17,7 @@ After preflight and confirmation, it:
 2. Removes direct on-premises AD memberships except the account's primary group and the names in `-KeepADGroups`. The defaults are `Domain Users` and `SG_Intranet Users`.
 3. Removes cloud-managed Exchange distribution/mail-enabled-security group memberships, Microsoft 365 group membership and ownership, and cloud-only static Entra security-group memberships.
 4. Prompts `Need to create a shared mailbox (YES or NO)`. `YES` converts the hybrid mailbox on both sides and grants the AD manager Full Access. `NO` skips conversion and manager mailbox access. `-GrantSendAs` is optional with `YES`.
-5. Removes eligible directly assigned Microsoft 365 licenses. With `YES`, removal requires verified mailbox conversion and manager Full Access. With `NO`, conversion/delegation is skipped and Exchange-license removal can deprovision the mailbox according to the organization's retention policy.
+5. Inventories Microsoft 365 licenses, writes direct SKU IDs to the audit, and flags direct-license removal as a manual Admin Center step. It never calls `Set-MgUserLicense`; removing a license-bearing group can still revoke its inherited license.
 6. Writes a time-stamped CSV audit log beside the scripts, including the shared-mailbox answer and termination-note value.
 
 The script is repeatable: already-completed actions are reported as skipped where they can be verified.
@@ -27,7 +29,7 @@ The script is repeatable: already-completed actions are reported as skipped wher
 - `ExchangeOnlineManagement`, `Microsoft.Graph.Authentication`, `Microsoft.Graph.Users`, `Microsoft.Graph.Users.Actions`, and `Microsoft.Graph.Groups` installed for the account running PowerShell.
 - The delegated AD account needs rights to disable users and remove the applicable AD group memberships.
 - The signed-in Exchange account needs rights to manage recipients, group memberships, mailbox types, and mailbox delegation.
-- The signed-in Microsoft Graph account needs the tenant roles that allow blocking sign-in, revoking sessions, changing group memberships, and removing licenses. The script requests `User.Read.All`, `User.EnableDisableAccount.All`, `User.RevokeSessions.All`, `GroupMember.ReadWrite.All`, and `LicenseAssignment.ReadWrite.All`; Graph consent scopes alone do not grant the administrative role.
+- The signed-in Microsoft Graph account needs the tenant roles that allow blocking sign-in, revoking sessions, and changing group memberships. The script requests `User.Read.All`, `User.EnableDisableAccount.All`, `User.RevokeSessions.All`, and `GroupMember.ReadWrite.All`. It does not request `LicenseAssignment.ReadWrite.All`; Graph consent scopes alone do not grant the administrative role.
 - When answering `YES` in a hybrid environment, supply the on-premises Exchange server FQDN so the delegated account can open an Exchange remote PowerShell session. The endpoint is expected at `http://SERVER/PowerShell/` unless a full URL is supplied. It isn't required when answering `NO`.
 
 ## Preview first
@@ -56,7 +58,7 @@ The script displays the resolved offboarding summary and, when required, the man
 OFFBOARD jsmith
 ```
 
-Exit code `2` means the script completed but the CSV contains follow-up items. Any other nonzero exit code means an error stopped the script.
+Exit code `2` means the script completed but the CSV contains follow-up items. On this branch, exit code `2` is expected whenever a direct license remains for manual removal. Any other nonzero exit code means an error stopped the script.
 
 ## Important switches
 
@@ -67,8 +69,6 @@ Exit code `2` means the script completed but the CSV contains follow-up items. A
 - `-GraphAdminUPN`: verifies that Microsoft Graph authenticated as the intended administrator instead of silently using a cached everyday-account context.
 - `-TransferSoleOwnedMicrosoft365GroupsToManager`: if the employee is the only Microsoft 365 group owner, adds the manager as member/owner before removing the employee. Without it, the script leaves that group unchanged and flags it for attention.
 - `-SkipCloudGroupRemoval`: skips Exchange Online, Microsoft 365, and cloud security-group cleanup.
-- `-SkipLicenseRemoval`: keeps every license.
-- `-OverrideSharedMailboxLicenseSafety`: allows direct-license removal even when the mailbox is over 50 GB, has an active archive, is on hold, or its size cannot be verified. Use only after the licensing/retention requirement is confirmed.
 - `-CloudOnlyMailbox`: with `-CreateSharedMailbox YES`, skips `Set-RemoteMailbox`. The script rejects this switch when Microsoft Graph reports that the account is directory-synchronized, because a later sync can revert or disconnect a mismatched unlicensed mailbox.
 - `-Force`: skips the typed `OFFBOARD username` prompt. It does not bypass permissions or safety gates.
 
@@ -83,7 +83,8 @@ The termination ticket should separately address anything that applies:
 - Reassign Teams private/shared-channel roles and direct SharePoint/OneDrive permissions; standard Team membership follows its Microsoft 365 group.
 - Configure mailbox forwarding or automatic replies if policy requires them. Full Access does not forward new mail.
 - Apply OneDrive retention/delegation, device wipe/retirement, phone/Teams Calling cleanup, and line-of-business application offboarding.
-- Follow legal-hold, retention, archive, and deletion policy before overriding the mailbox license gate or deleting the account.
+- Follow legal-hold, retention, archive, and deletion policy before manually removing an Exchange-bearing license or deleting the account.
+- After a successful shared-mailbox conversion and manager delegation, confirm the intended product name and remove that license manually in the Microsoft 365 Admin Center. The CSV records SKU IDs, not friendly product names. Do not remove the license when the audit reports mailbox conversion, delegation, size, archive, or hold warnings.
 - After directory synchronization and license processing, verify that no group-inherited license remains.
 
 ## Validation status

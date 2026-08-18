@@ -25,8 +25,6 @@ param(
     [switch]$GrantSendAs,
     [switch]$TransferSoleOwnedMicrosoft365GroupsToManager,
     [switch]$SkipCloudGroupRemoval,
-    [switch]$SkipLicenseRemoval,
-    [switch]$OverrideSharedMailboxLicenseSafety,
     [switch]$Force,
 
     [string]$LogPath
@@ -82,7 +80,7 @@ $Counts = @{
     Preview   = 0
     Attention = 0
 }
-$CanRemoveLicenses = $true
+$ManualLicenseRemovalReady = $true
 $OnPremExchangeSession = $null
 $ImportedOnPremExchangeModule = $null
 
@@ -336,7 +334,6 @@ $RequiredScopes = @(
     'User.Read.All'
     'User.EnableDisableAccount.All'
     'User.RevokeSessions.All'
-    'LicenseAssignment.ReadWrite.All'
     'GroupMember.ReadWrite.All'
 )
 $GraphContext = Get-MgContext
@@ -414,6 +411,7 @@ $DirectSkuIds = @($GraphUser.LicenseAssignmentStates |
     Where-Object { -not $_.AssignedByGroup } |
     ForEach-Object { $_.SkuId } |
     Sort-Object -Unique)
+$DirectSkuIdText = ($DirectSkuIds | ForEach-Object { $_.ToString() }) -join ', '
 $InheritedLicenseStates = @($GraphUser.LicenseAssignmentStates | Where-Object { $_.AssignedByGroup })
 
 $MailboxSizeBytes = ConvertTo-ByteCount $MailboxStatistics.TotalItemSize
@@ -523,14 +521,14 @@ if (-not $SkipCloudGroupRemoval) {
 }
 Write-Host "Licenses : $($DirectSkuIds.Count) direct; $($InheritedLicenseStates.Count) group-inherited assignment state(s)" -ForegroundColor White
 if ($CreateSharedMailboxRequested) {
-    Write-Host 'Mailbox action: convert to shared, grant the AD manager Full Access, then remove eligible licenses.' -ForegroundColor Yellow
+    Write-Host 'Mailbox action: convert to shared and grant the AD manager Full Access. Direct license removal remains manual.' -ForegroundColor Yellow
 }
 else {
-    Write-Warning 'Shared mailbox is NO. The script will not convert or delegate the mailbox. Removing its Exchange license can deprovision the mailbox according to your retention policy.'
+    Write-Warning 'Shared mailbox is NO. The script will not convert, delegate, or directly change license assignments. Group cleanup can revoke inherited licenses; manually removing an Exchange-bearing license can deprovision the mailbox according to your retention policy.'
 }
 
 if ($LicenseBlockers.Count -gt 0) {
-    Write-Warning "License safety check: $($LicenseBlockers -join '; '). License removal will be blocked unless -OverrideSharedMailboxLicenseSafety is explicitly supplied."
+    Write-Warning "Manual license-removal warning: $($LicenseBlockers -join '; '). Review these conditions and confirm the intended product before removing it in the Microsoft 365 Admin Center."
 }
 
 if (-not $Force -and -not $WhatIfPreference) {
@@ -758,11 +756,12 @@ elseif ($PSCmdlet.ShouldProcess($User, 'Convert the on-premises remote mailbox t
     }
     catch {
         $OnPremMailboxReady = $false
-        $CanRemoveLicenses = $false
+        $ManualLicenseRemovalReady = $false
         Add-Result -System 'On-premises Exchange' -Item $User -Action 'Convert remote mailbox to shared' -Status 'Failed' -Message $_.Exception.Message
     }
 }
 else {
+    $ManualLicenseRemovalReady = $false
     Add-Result -System 'On-premises Exchange' -Item $User -Action 'Convert remote mailbox to shared' -Status 'Preview'
 }
 
@@ -782,11 +781,12 @@ elseif ($PSCmdlet.ShouldProcess($EmployeeAddress, 'Convert the Exchange Online m
         Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'Convert to shared mailbox' -Status 'Completed'
     }
     catch {
-        $CanRemoveLicenses = $false
+        $ManualLicenseRemovalReady = $false
         Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'Convert to shared mailbox' -Status 'Failed' -Message $_.Exception.Message
     }
 }
 else {
+    $ManualLicenseRemovalReady = $false
     Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'Convert to shared mailbox' -Status 'Preview'
 }
 
@@ -813,11 +813,12 @@ try {
         Add-Result -System 'Exchange Online' -Item $ManagerAddress -Action 'Grant mailbox Full Access' -Status 'Completed'
     }
     else {
+        $ManualLicenseRemovalReady = $false
         Add-Result -System 'Exchange Online' -Item $ManagerAddress -Action 'Grant mailbox Full Access' -Status 'Preview'
     }
 }
 catch {
-    $CanRemoveLicenses = $false
+    $ManualLicenseRemovalReady = $false
     Add-Result -System 'Exchange Online' -Item $ManagerAddress -Action 'Grant mailbox Full Access' -Status 'Failed' -Message $_.Exception.Message
 }
 
@@ -843,46 +844,24 @@ if ($GrantSendAs) {
 }
 }
 
-if ($LicenseBlockers.Count -gt 0 -and -not $OverrideSharedMailboxLicenseSafety) {
-    $CanRemoveLicenses = $false
-    Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'License safety check' -Status 'Attention' -Message ($LicenseBlockers -join '; ')
-}
-elseif ($LicenseBlockers.Count -gt 0) {
-    Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'License safety check' -Status 'Attention' -Message ("Override supplied for: " + ($LicenseBlockers -join '; '))
+if ($LicenseBlockers.Count -gt 0) {
+    $ManualLicenseRemovalReady = $false
+    Add-Result -System 'Exchange Online' -Item $EmployeeAddress -Action 'Review manual license removal' -Status 'Attention' -Message ($LicenseBlockers -join '; ')
 }
 
-Write-Section 'Step 5 - remove Microsoft 365 licenses'
+Write-Section 'Step 5 - Microsoft 365 licenses (manual)'
 
-if ($SkipLicenseRemoval) {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove licenses' -Status 'Skipped' -Message 'SkipLicenseRemoval was specified.'
+if ($DirectSkuIds.Count -eq 0) {
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses manually' -Status 'Skipped' -Message 'No directly assigned licenses were found at preflight.'
 }
-elseif (-not $CanRemoveLicenses) {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove licenses' -Status 'Attention' -Message 'Safety gate blocked removal; resolve mailbox conversion, delegation, or licensing warnings first.'
+elseif (-not $CreateSharedMailboxRequested) {
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses manually' -Status 'Attention' -Message "$($DirectSkuIds.Count) directly assigned license(s) remain (SKU ID(s): $DirectSkuIdText). Shared mailbox was NO; manually removing an Exchange-bearing license can deprovision the mailbox, so follow the organization's retention decision and confirm the product name in the Admin Center."
 }
-elseif ($DirectSkuIds.Count -eq 0) {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses' -Status 'Skipped' -Message 'No directly assigned licenses found.'
-}
-elseif ($PSCmdlet.ShouldProcess($EmployeeAddress, "Remove $($DirectSkuIds.Count) directly assigned Microsoft 365 license(s)")) {
-    try {
-        Set-MgUserLicense -UserId $GraphUser.Id -AddLicenses @() -RemoveLicenses $DirectSkuIds -ErrorAction Stop | Out-Null
-
-        $VerifiedGraphUser = Get-MgUser -UserId $GraphUser.Id -Property LicenseAssignmentStates -ErrorAction Stop
-        $RemainingDirectSkuIds = @($VerifiedGraphUser.LicenseAssignmentStates |
-            Where-Object { -not $_.AssignedByGroup } |
-            ForEach-Object { $_.SkuId } |
-            Sort-Object -Unique)
-        if ($RemainingDirectSkuIds.Count -gt 0) {
-            throw "$($RemainingDirectSkuIds.Count) directly assigned license(s) remain after the removal request."
-        }
-
-        Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses' -Status 'Completed' -Message "$($DirectSkuIds.Count) license(s) removed and verified."
-    }
-    catch {
-        Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses' -Status 'Failed' -Message $_.Exception.Message
-    }
+elseif (-not $ManualLicenseRemovalReady) {
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses manually' -Status 'Attention' -Message "$($DirectSkuIds.Count) directly assigned license(s) remain (SKU ID(s): $DirectSkuIdText). Resolve the mailbox conversion, delegation, or licensing warnings, then confirm the intended product name in the Microsoft 365 Admin Center before manually removing it."
 }
 else {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses' -Status 'Preview' -Message "$($DirectSkuIds.Count) license(s)."
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove direct licenses manually' -Status 'Attention' -Message "$($DirectSkuIds.Count) directly assigned license(s) remain (SKU ID(s): $DirectSkuIdText). This branch never directly changes license assignments; confirm the intended product name in the Microsoft 365 Admin Center and remove it manually after reviewing the audit log."
 }
 
 if ($InheritedLicenseStates.Count -gt 0) {
