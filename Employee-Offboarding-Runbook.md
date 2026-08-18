@@ -15,8 +15,8 @@ After you review the results and confirm the offboarding, the script does the fo
 2. Removes the employee from directly assigned on-premises AD groups, except for the account's primary group and any groups listed in `-KeepADGroups`. By default, it keeps `Domain Users` and `SG_Intranet Users`.
 3. Removes the employee from cloud-managed Exchange distribution groups and mail-enabled security groups. It also removes Microsoft 365 group membership and ownership through Exchange Online. It does not ask Graph to inspect or remove Entra-only security groups.
 4. Asks `Need to create a shared mailbox (YES or NO)`. If you answer `YES`, it converts both sides of the hybrid mailbox and gives the AD manager Full Access. If you answer `NO`, it skips the mailbox conversion and does not give the manager mailbox access. You can also use `-GrantSendAs` with `YES`.
-5. Uses Graph only to remove the exact license SKU GUID you supply with `-LicenseSkuId`. Graph does not separately discover the SKU or read whether it is direct versus group-assigned. If you answer `YES`, the script must verify the mailbox conversion and the manager's Full Access before sending the removal. If you answer `NO`, it skips conversion and delegation. Removing an Exchange license in that case can deprovision the mailbox according to your organization's retention policy.
-6. Saves a time-stamped CSV audit log in the same folder as the scripts. The log includes the shared-mailbox answer, termination-note value, and supplied license SKU GUID.
+5. Uses Graph only to remove the one E3 product you select from a simple menu. You do not need to know or type its internal SKU GUID. Graph does not separately discover the employee's license or read whether it is direct versus group-assigned. Other licenses and add-ons remain for manual review. If you answer `YES`, the script must verify the mailbox conversion and the manager's Full Access before sending the removal. If you answer `NO`, it skips conversion and delegation. Removing an Exchange license in that case can deprovision the mailbox according to your organization's retention policy.
+6. Saves a time-stamped CSV audit log in the same folder as the scripts. The log includes the shared-mailbox answer, termination-note value, selected license name, SKU part number, and SKU GUID.
 
 You can run the script again if needed. When it can verify that an action is already complete, it reports that action as skipped.
 
@@ -31,23 +31,35 @@ You can run the script again if needed. When it can verify that an action is alr
 - The login page can also show **Maintain access to data you have given it access to** (`offline_access`). Microsoft authentication adds that sign-in scope automatically so the login can refresh its token; it does not grant access to any additional user, group, or license data.
 - If you answer `YES` in a hybrid environment, enter the on-premises Exchange server FQDN. The delegated account uses it to open a remote Exchange PowerShell session. Unless you enter a full URL, the script expects the endpoint to be `http://SERVER/PowerShell/`. You do not need the server FQDN when you answer `NO`.
 
-## Confirm the license SKU first
+## Choosing the E3 license
 
-`E3` is not one universal product. For example, Office 365 E3 (`ENTERPRISEPACK`) and Microsoft 365 E3 (`SPE_E3`) use different SKU GUIDs, and regional variants also exist. Have the security or Microsoft 365 team confirm the exact SKU assigned in your tenant. Do not guess or copy an example GUID into a live offboarding run. Microsoft keeps the product list in its [license service-plan reference](https://learn.microsoft.com/en-us/entra/identity/users/licensing-service-plan-reference).
+When you run the BAT without either `-LicenseSkuId` or `-SkipLicenseRemoval`, it asks you to choose:
+
+```text
+1. Microsoft 365 E3 [SPE_E3]
+2. Office 365 E3 [ENTERPRISEPACK]
+3. Microsoft 365 E3 (no Teams) [Microsoft_365_E3_(no_Teams)]
+4. Office 365 E3 (no Teams) [Office_365_E3_(no_Teams)]
+S. Skip license removal for this run
+```
+
+Open the employee in the Microsoft 365 admin center and look under **Licenses and apps**. Match the full product name whose checkbox is checked for that employee: if it literally says **Microsoft 365 E3**, choose `1`; if it says **Office 365 E3**, choose `2`. If the checked product name does not exactly match one of the choices, choose `S` instead of guessing.
+
+The script keeps Microsoft's published GUID behind each friendly name. `-LicenseSkuId` is still available as an advanced override for one externally verified SKU, but the normal BAT workflow does not need it. Microsoft publishes the mappings in its [license service-plan reference](https://learn.microsoft.com/en-us/entra/identity/users/licensing-service-plan-reference).
 
 ## Preview first
 
-Start with a preview. Replace the example values with the employee's real SAM account name, administrator UPNs, Exchange server FQDN, and the exact confirmed license SKU GUID:
+Start with a preview. Replace the example values with the employee's real SAM account name, administrator UPNs, and Exchange server FQDN. The script will ask which E3 product to remove:
 
 ```bat
-Run-EmployeeOffboarding.bat jsmith -OnPremExchangeServer exch01.contoso.local -ExchangeAdminUPN admin@contoso.com -GraphAdminUPN admin@contoso.com -LicenseSkuId PASTE-CONFIRMED-GUID-HERE -WhatIf
+Run-EmployeeOffboarding.bat jsmith -OnPremExchangeServer exch01.contoso.local -ExchangeAdminUPN admin@contoso.com -GraphAdminUPN admin@contoso.com -WhatIf
 ```
 
 Read every line of the preview before doing a live run. Pay special attention to the protected intranet group name and make sure it exactly matches the name in your environment.
 
 `Inspecting Exchange Online group memberships...` can take several minutes. Without Graph group-read permission, Exchange has to check the groups individually. Use `-SkipCloudGroupRemoval` only when that cleanup is being handled somewhere else.
 
-To run the rest of the preview with no Graph module or Graph login at all, use `-SkipLicenseRemoval` and leave out both `-GraphAdminUPN` and `-LicenseSkuId`:
+To run the rest of the preview with no Graph module or Graph login at all, use `-SkipLicenseRemoval` and leave out `-GraphAdminUPN`:
 
 ```bat
 Run-EmployeeOffboarding.bat jsmith -OnPremExchangeServer exch01.contoso.local -ExchangeAdminUPN admin@contoso.com -SkipLicenseRemoval -WhatIf
@@ -60,7 +72,7 @@ If you leave out `-CreateSharedMailbox`, the script asks you to answer `YES` or 
 When the preview looks correct, run the same command without `-WhatIf`:
 
 ```bat
-Run-EmployeeOffboarding.bat jsmith -OnPremExchangeServer exch01.contoso.local -ExchangeAdminUPN admin@contoso.com -GraphAdminUPN admin@contoso.com -LicenseSkuId PASTE-CONFIRMED-GUID-HERE
+Run-EmployeeOffboarding.bat jsmith -OnPremExchangeServer exch01.contoso.local -ExchangeAdminUPN admin@contoso.com -GraphAdminUPN admin@contoso.com
 ```
 
 The script shows you the offboarding summary and, when needed, the manager it found. It then asks you to type this exact confirmation:
@@ -78,11 +90,11 @@ Exit code `2` means the script finished, but the CSV log has items that still ne
 - `-TerminationDate YYYY-MM-DD`: uses the date you enter instead of today's date in the AD Notes marker. If you leave it out, the script uses the date on which it runs, such as `TERM: 08/17/2026`.
 - `-GrantSendAs`: also gives the manager Send As permission. Full Access by itself does not let the manager send mail as the former employee.
 - `-GraphAdminUPN`: checks that Microsoft Graph signed in with the administrator you intended to use, instead of quietly reusing a cached everyday-account sign-in.
-- `-LicenseSkuId GUID`: supplies the exact directly assigned license SKU to remove. The script prints the value before confirmation but does not discover or validate the product name through Graph.
+- `-LicenseSkuId GUID`: optional advanced override for one externally verified SKU. Leave it out for the normal friendly-name menu. The script prints the selected product and GUID before confirmation but does not discover the employee's current assignment through Graph.
 - `-TransferSoleOwnedMicrosoft365GroupsToManager`: if the employee is the only owner of a Microsoft 365 group, the script adds the manager as a member and owner before removing the employee. Without this switch, it leaves that group alone and flags it for attention.
 - `-SkipCloudGroupRemoval`: skips cleanup of Exchange Online distribution and Microsoft 365 groups. The script can still remove on-premises AD groups, and those changes can sync to directory-synchronized cloud groups.
-- `-SkipLicenseRemoval`: skips direct license removal and completely skips Graph module loading and Graph login. Group cleanup can still remove a license that was assigned through a group.
-- `-OverrideSharedMailboxLicenseSafety`: allows the script to submit the supplied license SKU even when the mailbox is over 50 GB, has an active archive, is on hold, or has a size the script cannot verify. Use this only after confirming the licensing and retention requirements.
+- `-SkipLicenseRemoval`: skips the selected license-removal request and completely skips Graph module loading and Graph login. Group cleanup can still remove a license that was assigned through a group.
+- `-OverrideSharedMailboxLicenseSafety`: allows the script to submit the selected license even when the mailbox is over 50 GB, has an active archive, is on hold, or has a size the script cannot verify. Use this only after confirming the licensing and retention requirements.
 - `-CloudOnlyMailbox`: when used with `-CreateSharedMailbox YES`, skips `Set-RemoteMailbox`. The script allows this only when Exchange Online explicitly reports that the mailbox is not directory-synchronized. A later sync could otherwise revert or disconnect a mismatched, unlicensed mailbox.
 - `-Force`: skips the typed `OFFBOARD username` confirmation. It does not bypass permissions or any safety checks.
 

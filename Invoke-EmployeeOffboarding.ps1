@@ -43,7 +43,7 @@ param(
     [switch]$SkipCloudGroupRemoval,
     # Skip the Graph license-removal request entirely.
     [switch]$SkipLicenseRemoval,
-    # Exact directly assigned SKU GUID to remove. Supplying it keeps Graph limited to a license write.
+    # Optional advanced override. Normally the script asks you to choose the E3 product by name.
     [guid]$LicenseSkuId,
     # Allow removal despite a hold, archive, large mailbox, or unknown size. Use this carefully.
     [switch]$OverrideSharedMailboxLicenseSafety,
@@ -86,15 +86,53 @@ $CreateSharedMailbox = $CreateSharedMailbox.ToUpperInvariant()
 $CreateSharedMailboxRequested = $CreateSharedMailbox -eq 'YES'
 $TerminationNote = 'TERM: {0:MM/dd/yyyy}' -f $TerminationDate
 
+# Keep the common E3 products behind friendly names so the BAT never needs an internal SKU GUID.
+$KnownLicenseSkus = [ordered]@{
+    '1' = [pscustomobject]@{ Name = 'Microsoft 365 E3';            PartNumber = 'SPE_E3';                        SkuId = [guid]'05e9a617-0261-4cee-bb44-138d3ef5d965' }
+    '2' = [pscustomobject]@{ Name = 'Office 365 E3';               PartNumber = 'ENTERPRISEPACK';                 SkuId = [guid]'6fd2c87f-b296-42f0-b197-1e91e994b900' }
+    '3' = [pscustomobject]@{ Name = 'Microsoft 365 E3 (no Teams)'; PartNumber = 'Microsoft_365_E3_(no_Teams)';    SkuId = [guid]'dcf0408c-aaec-446c-afd4-43e3683943ea' }
+    '4' = [pscustomobject]@{ Name = 'Office 365 E3 (no Teams)';    PartNumber = 'Office_365_E3_(no_Teams)';       SkuId = [guid]'46c3a859-c90d-40b3-9551-6178a48d5c18' }
+}
+$LicenseSkuName = 'Skipped'
+$LicenseSkuPartNumber = ''
+
+# If no advanced SKU override was supplied, ask for the exact product name shown in Microsoft 365.
+if (-not $SkipLicenseRemoval -and ($null -eq $LicenseSkuId -or $LicenseSkuId -eq [guid]::Empty)) {
+    while ($LicenseSkuName -eq 'Skipped' -and -not $SkipLicenseRemoval) {
+        Write-Host "`nLicense to remove:" -ForegroundColor Cyan
+        foreach ($ChoiceKey in $KnownLicenseSkus.Keys) {
+            Write-Host "  $ChoiceKey. $($KnownLicenseSkus[$ChoiceKey].Name) [$($KnownLicenseSkus[$ChoiceKey].PartNumber)]"
+        }
+        Write-Host '  S. Skip license removal for this run'
+
+        $LicenseChoice = (Read-Host 'Choose 1, 2, 3, 4, or S').Trim().ToUpperInvariant()
+        if ($LicenseChoice -eq 'S') {
+            $SkipLicenseRemoval = $true
+        }
+        elseif ($KnownLicenseSkus.Contains($LicenseChoice)) {
+            $LicenseSkuName = $KnownLicenseSkus[$LicenseChoice].Name
+            $LicenseSkuPartNumber = $KnownLicenseSkus[$LicenseChoice].PartNumber
+            $LicenseSkuId = $KnownLicenseSkus[$LicenseChoice].SkuId
+        }
+        else {
+            Write-Warning 'Choose 1, 2, 3, 4, or S.'
+        }
+    }
+}
+elseif (-not $SkipLicenseRemoval) {
+    $KnownLicenseMatch = $KnownLicenseSkus.Values |
+        Where-Object { $_.SkuId -eq $LicenseSkuId } |
+        Select-Object -First 1
+    $LicenseSkuName = if ($KnownLicenseMatch) { $KnownLicenseMatch.Name } else { 'Custom SKU supplied on the command line' }
+    $LicenseSkuPartNumber = if ($KnownLicenseMatch) { $KnownLicenseMatch.PartNumber } else { 'Not supplied' }
+}
+
 # Catch switch combinations that cannot make sense before any connections or changes happen.
 if (-not $CreateSharedMailboxRequested -and $CloudOnlyMailbox) {
     throw '-CloudOnlyMailbox is only meaningful when -CreateSharedMailbox YES is selected.'
 }
 if (-not $CreateSharedMailboxRequested -and $GrantSendAs) {
     throw '-GrantSendAs requires -CreateSharedMailbox YES.'
-}
-if (-not $SkipLicenseRemoval -and ($null -eq $LicenseSkuId -or $LicenseSkuId -eq [guid]::Empty)) {
-    throw 'License removal needs the exact directly assigned SKU GUID. Supply -LicenseSkuId <GUID>, or use -SkipLicenseRemoval to run without Microsoft Graph.'
 }
 
 # Use a supplied credential when there is one; otherwise, ask for the delegated AD account and password.
@@ -136,6 +174,8 @@ function Add-AuditRecord {
         User                   = $script:User
         SharedMailboxRequested = $script:CreateSharedMailbox
         TerminationNote        = $script:TerminationNote
+        LicenseSkuName         = $script:LicenseSkuName
+        LicenseSkuPartNumber   = $script:LicenseSkuPartNumber
         LicenseSkuId           = if ($script:SkipLicenseRemoval) { '' } else { $script:LicenseSkuId.ToString() }
         System                 = $System
         Item                   = $Item
@@ -623,11 +663,12 @@ if ($SkipLicenseRemoval) {
     Write-Host 'Licenses : skipped; Microsoft Graph will not be loaded or connected' -ForegroundColor Gray
 }
 else {
-    Write-Host "License SKU target(s): $($DirectSkuIds -join ', ')" -ForegroundColor White
-    Write-Warning 'Graph will only submit removal of the supplied SKU GUID. No separate profile or license-inventory GET is made, so the script cannot distinguish direct from group-assigned licensing.'
+    Write-Host "License  : $LicenseSkuName [$LicenseSkuPartNumber]" -ForegroundColor White
+    Write-Host "SKU GUID : $($DirectSkuIds[0])" -ForegroundColor White
+    Write-Warning 'Graph will only submit removal of this selected product. No separate profile or license-inventory GET is made, so the script cannot distinguish direct from group-assigned licensing.'
 }
 if ($CreateSharedMailboxRequested -and -not $SkipLicenseRemoval) {
-    Write-Host 'Mailbox action: convert to shared, grant the AD manager Full Access, then remove the supplied license SKU(s) when the safety checks pass.' -ForegroundColor Yellow
+    Write-Host 'Mailbox action: convert to shared, grant the AD manager Full Access, then remove the selected license when the safety checks pass.' -ForegroundColor Yellow
 }
 elseif ($CreateSharedMailboxRequested) {
     Write-Host 'Mailbox action: convert to shared and grant the AD manager Full Access. License removal is skipped.' -ForegroundColor Yellow
@@ -648,7 +689,7 @@ if (-not $Force -and -not $WhatIfPreference) {
         "Continue? Type OFFBOARD $User to make these changes"
     }
     else {
-        "Confirm license SKU $($DirectSkuIds[0]) is correct. Then type OFFBOARD $User"
+        "Confirm $LicenseSkuName [$LicenseSkuPartNumber / $($DirectSkuIds[0])] is correct. Then type OFFBOARD $User"
     }
     $Answer = Read-Host $ConfirmationPrompt
     if ($Answer -cne "OFFBOARD $User") {
@@ -972,7 +1013,7 @@ if (-not $SkipLicenseRemoval) {
     }
 }
 
-Write-Section 'Step 5 - remove Microsoft 365 licenses'
+Write-Section 'Step 5 - remove the selected Microsoft 365 license'
 
 # License removal can be skipped directly or blocked automatically by an earlier safety failure.
 if ($SkipLicenseRemoval) {
@@ -982,10 +1023,10 @@ elseif (-not $CanRemoveLicenses) {
     Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove licenses' -Status 'Attention' -Message 'Safety gate blocked removal; resolve mailbox conversion, delegation, or licensing warnings first.'
 }
 elseif ($DirectSkuIds.Count -eq 0) {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove supplied license SKU(s)' -Status 'Attention' -Message 'No SKU GUID was supplied, so no Graph license request was sent.'
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove selected license' -Status 'Attention' -Message 'No license product was selected, so no Graph license request was sent.'
 }
-# Submit only the operator-supplied SKU GUIDs; no Graph user-profile or license-inventory read is made.
-elseif ($PSCmdlet.ShouldProcess($EmployeeAddress, "Remove supplied Microsoft 365 license SKU(s): $($DirectSkuIds -join ', ')")) {
+# Submit only the selected SKU GUID; no Graph user-profile or license-inventory read is made.
+elseif ($PSCmdlet.ShouldProcess($EmployeeAddress, "Remove $LicenseSkuName [$($DirectSkuIds[0])]")) {
     try {
         $LicenseRemovalResult = Set-MgUserLicense `
             -UserId $EmployeeCloudObjectId.ToString() `
@@ -1001,7 +1042,7 @@ elseif ($PSCmdlet.ShouldProcess($EmployeeAddress, "Remove supplied Microsoft 365
         }
 
         if (-not $AssignedLicensesProperty -or $null -eq $AssignedLicensesProperty.Value) {
-            Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove supplied license SKU(s)' -Status 'Attention' -Message 'Graph accepted the request, but its response did not include assigned-license state. Verify the result in the Microsoft 365 admin center.'
+            Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action "Remove $LicenseSkuName" -Status 'Attention' -Message 'Graph accepted the request, but its response did not include assigned-license state. Verify the result in the Microsoft 365 admin center.'
         }
         else {
             $RemainingTargetSkuIds = @(
@@ -1015,19 +1056,19 @@ elseif ($PSCmdlet.ShouldProcess($EmployeeAddress, "Remove supplied Microsoft 365
             )
 
             if ($RemainingTargetSkuIds.Count -gt 0) {
-                Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove supplied license SKU(s)' -Status 'Attention' -Message "Graph accepted the request, but its response still lists: $($RemainingTargetSkuIds -join ', '). The SKU may also be group-assigned; verify it manually."
+                Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action "Remove $LicenseSkuName" -Status 'Attention' -Message "Graph accepted the request, but its response still lists the selected SKU. It may also be group-assigned; verify it manually."
             }
             else {
-                Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove supplied license SKU(s)' -Status 'Completed' -Message "Graph's response no longer lists: $($DirectSkuIds -join ', ')."
+                Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action "Remove $LicenseSkuName" -Status 'Completed' -Message "Graph's response no longer lists the selected SKU."
             }
         }
     }
     catch {
-        Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove supplied license SKU(s)' -Status 'Failed' -Message $_.Exception.Message
+        Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action "Remove $LicenseSkuName" -Status 'Failed' -Message $_.Exception.Message
     }
 }
 else {
-    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action 'Remove supplied license SKU(s)' -Status 'Preview' -Message ($DirectSkuIds -join ', ')
+    Add-Result -System 'Microsoft 365' -Item $EmployeeAddress -Action "Remove $LicenseSkuName" -Status 'Preview' -Message $DirectSkuIds[0]
 }
 
 # A write-only Graph scope cannot independently inventory direct versus inherited licenses.
