@@ -27,6 +27,7 @@ param(
     # Use this only for a truly cloud-only mailbox; the script rejects it for synced users.
     [switch]$CloudOnlyMailbox,
 
+    #test commit
     # YES converts/delegates the mailbox. NO leaves the mailbox alone.
     [ValidateSet('YES', 'NO')]
     [string]$CreateSharedMailbox,
