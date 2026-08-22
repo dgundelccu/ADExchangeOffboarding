@@ -293,7 +293,7 @@ catch {
 }
 
 do {
-    $ConfirmEmployee = (Read-Host "is $($EmployeeAD.DisplayName) ($(EmployeeAD.SamAccountName)) the user you want to offboard? (YES or NO)").Trim().ToUpperInvariant()
+    $ConfirmEmployee = (Read-Host "is $($EmployeeAD.DisplayName) ($($EmployeeAD.SamAccountName)) the user you want to offboard? (YES or NO)").Trim().ToUpperInvariant()
     if ($ConfirmEmployee -notin @('YES', 'NO')){
         Write-Warning 'Must enter exactly YES or NO pls...'
     }
